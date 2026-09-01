@@ -18,5 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy source code
 COPY . .
 
+# Expose port for Render Web Service health checks
+ENV PORT=8080
+EXPOSE 8080
+
 # Run Discord Bot
 CMD ["python", "bot.py"]
