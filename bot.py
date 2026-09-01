@@ -1,8 +1,11 @@
 import asyncio
 import io
 import logging
+import os
 import time
 from typing import Optional, List, Dict, Any
+import aiohttp
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -85,6 +88,23 @@ def generate_flow_bar(buy_pct: float) -> str:
     green_blocks = int(round(buy_pct / 10))
     red_blocks = 10 - green_blocks
     return "🟩" * green_blocks + "🟥" * red_blocks + f" **{buy_pct:.1f}% Buys** vs **{100-buy_pct:.1f}% Sells**"
+
+
+# ==================== CLOUD WEB HEALTH CHECK (FOR RENDER / KOYEB) ====================
+
+async def handle_health_check(request):
+    return web.Response(text="🟢 MEXC AI Trading Bot is LIVE & Healthy!", status=200)
+
+async def start_web_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    app.router.add_get("/health", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Cloud Web Health Server running on port {port}")
 
 
 # ==================== 1-CLICK INTERACTIVE UI BUTTONS ====================
@@ -2126,6 +2146,9 @@ async def main():
     if not token or token == "your_discord_bot_token_here":
         print("\n❌ ERROR: DISCORD_BOT_TOKEN is not set in .env!\n")
         return
+
+    # Start cloud web health server in background for Render/Koyeb
+    asyncio.create_task(start_web_health_server())
 
     try:
         await bot.start(token)
