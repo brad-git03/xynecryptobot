@@ -1,0 +1,30 @@
+# Environment variables (NEVER COMMIT YOUR REAL BOT TOKEN)
+.env
+.env.local
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# Database files (user trade history & virtual balances)
+*.db
+*.sqlite3
+paper_trading.db
+
+# Logs & test outputs
+*.log
+test_output/
+.system_generated/
+scratch/
+
+# IDE configs
+.idea/
+.vscode/
+*.swp
