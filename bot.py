@@ -1159,6 +1159,7 @@ async def watchema_command(
     symbol: str,
     timeframe: Optional[app_commands.Choice[str]] = None,
 ):
+    await interaction.response.defer(thinking=True)
     tf = timeframe.value if timeframe else "1m"
     disp = format_display_symbol(symbol)
     success, msg, watch = paper_trader.start_ema_watch(
@@ -1170,7 +1171,51 @@ async def watchema_command(
     )
     if not ema_sentinel_loop.is_running():
         ema_sentinel_loop.start()
-    await interaction.response.send_message(msg)
+
+    # Send immediate live snapshot
+    df = await mexc_client.get_klines(disp, interval=tf, limit=210)
+    if df is not None and len(df) >= 55:
+        ema9 = CryptoAnalyzer.calculate_ema(df["close"], 9)
+        ema21 = CryptoAnalyzer.calculate_ema(df["close"], 21)
+        ema50 = CryptoAnalyzer.calculate_ema(df["close"], 50)
+        ema200 = CryptoAnalyzer.calculate_ema(df["close"], 200) if len(df) >= 200 else ema50
+
+        e9 = float(ema9.iloc[-1])
+        e21 = float(ema21.iloc[-1])
+        e50 = float(ema50.iloc[-1])
+        e200 = float(ema200.iloc[-1])
+        curr_p = float(df["close"].iloc[-1])
+
+        if e200 > e50 and e50 > e21 and e21 > e9:
+            title = "🚀 BEARISH WATERFALL IN PROGRESS: Sellers in Full Control! 🔴"
+            verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
+            color = config.COLOR_STRONG_SELL
+        elif e9 > e21 and e21 > e50 and e50 > e200:
+            title = "🚀 BULLISH RAINBOW IN PROGRESS: Buyers in Full Control! 🟢"
+            verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
+            color = config.COLOR_STRONG_BUY
+        else:
+            title = "⏳ CONSOLIDATION / SQUEEZE ZONE: Awaiting Clear Trend"
+            verdict = "⏳ **ENTRY VERDICT: ⏳ WAIT FOR EMA BREAKOUT / ALIGNMENT**"
+            color = 0xF39C12
+
+        embed = build_ema_alert_embed(
+            symbol=disp,
+            timeframe=tf,
+            event_title=title,
+            verdict_badge=verdict,
+            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, and entry confirmations!",
+            action_advice="• Keep your chart open on MEXC with EMA 9, 21, 50, 200.\n• Type `/stopema` or `!stopema` to disengage notifications at any time.",
+            curr_p=curr_p,
+            e9=e9,
+            e21=e21,
+            e50=e50,
+            e200=e200,
+            color=color,
+        )
+        await interaction.followup.send(content=msg, embed=embed)
+    else:
+        await interaction.followup.send(msg)
 
 
 @bot.tree.command(name="stopema", description="🛑 Stop and close the automated EMA Notifier.")
@@ -1954,7 +1999,51 @@ async def prefix_watchema(ctx: commands.Context, symbol: str = "ETH", timeframe:
     )
     if not ema_sentinel_loop.is_running():
         ema_sentinel_loop.start()
-    await ctx.send(msg)
+
+    # Send immediate live snapshot
+    df = await mexc_client.get_klines(disp, interval=tf, limit=210)
+    if df is not None and len(df) >= 55:
+        ema9 = CryptoAnalyzer.calculate_ema(df["close"], 9)
+        ema21 = CryptoAnalyzer.calculate_ema(df["close"], 21)
+        ema50 = CryptoAnalyzer.calculate_ema(df["close"], 50)
+        ema200 = CryptoAnalyzer.calculate_ema(df["close"], 200) if len(df) >= 200 else ema50
+
+        e9 = float(ema9.iloc[-1])
+        e21 = float(ema21.iloc[-1])
+        e50 = float(ema50.iloc[-1])
+        e200 = float(ema200.iloc[-1])
+        curr_p = float(df["close"].iloc[-1])
+
+        if e200 > e50 and e50 > e21 and e21 > e9:
+            title = "🚀 BEARISH WATERFALL IN PROGRESS: Sellers in Full Control! 🔴"
+            verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
+            color = config.COLOR_STRONG_SELL
+        elif e9 > e21 and e21 > e50 and e50 > e200:
+            title = "🚀 BULLISH RAINBOW IN PROGRESS: Buyers in Full Control! 🟢"
+            verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
+            color = config.COLOR_STRONG_BUY
+        else:
+            title = "⏳ CONSOLIDATION / SQUEEZE ZONE: Awaiting Clear Trend"
+            verdict = "⏳ **ENTRY VERDICT: ⏳ WAIT FOR EMA BREAKOUT / ALIGNMENT**"
+            color = 0xF39C12
+
+        embed = build_ema_alert_embed(
+            symbol=disp,
+            timeframe=tf,
+            event_title=title,
+            verdict_badge=verdict,
+            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, and entry confirmations!",
+            action_advice="• Keep your chart open on MEXC with EMA 9, 21, 50, 200.\n• Type `!stopema` to disengage notifications at any time.",
+            curr_p=curr_p,
+            e9=e9,
+            e21=e21,
+            e50=e50,
+            e200=e200,
+            color=color,
+        )
+        await ctx.send(content=msg, embed=embed)
+    else:
+        await ctx.send(msg)
 
 
 @bot.command(name="stopema", aliases=["emaoff", "stopwatchema", "closeema"])
@@ -2804,6 +2893,12 @@ async def ema_sentinel_loop():
 
                 if is_new_event or is_cooldown_ready:
                     ch = bot.get_channel(watch.channel_id)
+                    if not ch:
+                        try:
+                            ch = await bot.fetch_channel(watch.channel_id)
+                        except Exception as err:
+                            logger.warning(f"Could not fetch channel {watch.channel_id}: {err}")
+                            ch = None
                     if ch:
                         embed = build_ema_alert_embed(
                             symbol=watch.symbol,
