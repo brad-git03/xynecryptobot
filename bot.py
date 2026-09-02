@@ -14,7 +14,7 @@ import config
 from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, resolve_symbols
 from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus, SafeEntrySetup
 from chart_generator import ChartGenerator
-from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade
+from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade, EMAWatch
 
 # Logging configuration
 logging.basicConfig(
@@ -374,6 +374,48 @@ def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
     embed.add_field(name="🦈 Whale Stop-Hunt & Liquidity Sweep Tracker", value=setup.liquidity_sweep_status, inline=False)
 
     embed.set_footer(text="Never market-chase green/red candles • Place post-only limit orders in the safe entry zone")
+    return embed
+
+
+def build_ema_alert_embed(
+    symbol: str,
+    timeframe: str,
+    event_title: str,
+    what_it_means: str,
+    action_advice: str,
+    curr_p: float,
+    e9: float,
+    e21: float,
+    e50: float,
+    e200: float,
+    color: int = 0xE67E22,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🔔 EMA AUTO-SENTINEL: {symbol} ({timeframe})",
+        color=color,
+        description=f"### {event_title}\n**Live Price:** `${curr_p:,.2f}`",
+    )
+    embed.add_field(
+        name="💡 What This Indicates",
+        value=what_it_means,
+        inline=False,
+    )
+    embed.add_field(
+        name="🎯 Actionable Advice",
+        value=action_advice,
+        inline=False,
+    )
+    embed.add_field(
+        name="📊 Real-Time EMA Cluster",
+        value=(
+            f"• 🟣 **EMA 200 (Macro Boss):** `${e200:,.2f}`\n"
+            f"• 🔵 **EMA 50 (Backbone):** `${e50:,.2f}`\n"
+            f"• 🟢 **EMA 21 (Pullback Level):** `${e21:,.2f}`\n"
+            f"• 🟡 **EMA 9 (Trigger):** `${e9:,.2f}`"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Auto-monitoring active • Type !stopema to disengage notifications")
     return embed
 
 
@@ -916,6 +958,10 @@ async def on_ready():
         active_trade_copilot_loop.start()
         logger.info("Active Trade Copilot Sentinel started (Monitoring tracked positions every 15s).")
 
+    if not ema_sentinel_loop.is_running():
+        ema_sentinel_loop.start()
+        logger.info("Real-Time EMA Sentinel started (Monitoring active EMA watches every 12s).")
+
 
 # ==================== ORDER FLOW & LIQUIDITY COMMANDS ====================
 
@@ -1086,6 +1132,53 @@ async def stoptrack_command(interaction: discord.Interaction):
         await interaction.response.send_message("🏁 AI Trade Copilot disengaged. Tracking stopped successfully!")
     else:
         await interaction.response.send_message("ℹ️ No active trade was being tracked.", ephemeral=True)
+
+
+@bot.tree.command(name="watchema", description="🔔 EMA Auto-Notifier: Get automated alerts when EMAs touch, intersect, or trigger setups.")
+@app_commands.describe(
+    symbol="Asset symbol (e.g. ETH, BTC, GOLD, SOL)",
+    timeframe="Timeframe to watch (1m, 5m, 15m, 1h) - Default: 1m",
+)
+@app_commands.choices(
+    timeframe=[
+        app_commands.Choice(name="1 Minute (Fast Scalping)", value="1m"),
+        app_commands.Choice(name="5 Minutes (Scalp / Day Trade)", value="5m"),
+        app_commands.Choice(name="15 Minutes (Swing)", value="15m"),
+        app_commands.Choice(name="1 Hour (Macro Trend)", value="1h"),
+    ],
+)
+async def watchema_command(
+    interaction: discord.Interaction,
+    symbol: str,
+    timeframe: Optional[app_commands.Choice[str]] = None,
+):
+    tf = timeframe.value if timeframe else "1m"
+    disp = format_display_symbol(symbol)
+    success, msg, watch = paper_trader.start_ema_watch(
+        user_id=str(interaction.user.id),
+        user_name=interaction.user.display_name,
+        channel_id=interaction.channel.id,
+        symbol=disp,
+        timeframe=tf,
+    )
+    if not ema_sentinel_loop.is_running():
+        ema_sentinel_loop.start()
+    await interaction.response.send_message(msg)
+
+
+@bot.tree.command(name="stopema", description="🛑 Stop and close the automated EMA Notifier.")
+async def stopema_command(interaction: discord.Interaction):
+    ok, msg = paper_trader.stop_ema_watch(str(interaction.user.id))
+    await interaction.response.send_message(msg, ephemeral=not ok)
+
+
+@bot.tree.command(name="emastatus", description="📊 Check status of your active EMA Auto-Notifier.")
+async def emastatus_command(interaction: discord.Interaction):
+    watch = paper_trader.get_active_ema_watch(str(interaction.user.id))
+    if not watch:
+        await interaction.response.send_message("ℹ️ You do not have any active EMA Auto-Notifier running. Use `/watchema` or `!watchema <symbol>` to start!", ephemeral=True)
+        return
+    await interaction.response.send_message(f"🔔 **EMA Auto-Sentinel is ACTIVE for {watch.symbol} on `{watch.timeframe}`!**\nAuto-monitoring touches, crossings & breakouts. Type `/stopema` or `!stopema` to stop.")
 
 
 # ==================== SLASH COMMANDS ====================
@@ -1838,6 +1931,42 @@ async def prefix_safeentry(ctx: commands.Context, symbol: str = "BTC/USDT"):
         await ctx.send(embed=embed, view=view)
 
 
+@bot.command(name="watchema", aliases=["emawatch", "emalerts", "notifyema"])
+async def prefix_watchema(ctx: commands.Context, symbol: str = "ETH", timeframe: str = "1m"):
+    """Usage: !watchema ETH 1m or !watchema BTC 5m"""
+    disp = format_display_symbol(symbol)
+    tf = timeframe.lower()
+    if tf not in ("1m", "5m", "15m", "1h", "4h"):
+        tf = "1m"
+    success, msg, watch = paper_trader.start_ema_watch(
+        user_id=str(ctx.author.id),
+        user_name=ctx.author.display_name,
+        channel_id=ctx.channel.id,
+        symbol=disp,
+        timeframe=tf,
+    )
+    if not ema_sentinel_loop.is_running():
+        ema_sentinel_loop.start()
+    await ctx.send(msg)
+
+
+@bot.command(name="stopema", aliases=["emaoff", "stopwatchema", "closeema"])
+async def prefix_stopema(ctx: commands.Context):
+    """Usage: !stopema"""
+    ok, msg = paper_trader.stop_ema_watch(str(ctx.author.id))
+    await ctx.send(msg)
+
+
+@bot.command(name="emastatus", aliases=["status_ema"])
+async def prefix_emastatus(ctx: commands.Context):
+    """Usage: !emastatus"""
+    watch = paper_trader.get_active_ema_watch(str(ctx.author.id))
+    if not watch:
+        await ctx.send("ℹ️ You do not have any active EMA Auto-Notifier running. Type `!watchema <symbol> [1m/5m]` to start!")
+        return
+    await ctx.send(f"🔔 **EMA Auto-Sentinel is ACTIVE for {watch.symbol} on `{watch.timeframe}`!**\nAuto-monitoring touches, crossings & breakouts. Type `!stopema` to stop.")
+
+
 @bot.command(name="entrypricein", aliases=["track", "follow"])
 async def prefix_entrypricein(ctx: commands.Context, *args):
     """
@@ -2473,6 +2602,177 @@ async def active_trade_copilot_loop():
         logger.error(f"Error in active_trade_copilot_loop: {e}")
 
 
+# ==================== REAL-TIME EMA SENTINEL & AUTO-NOTIFIER ====================
+
+@tasks.loop(seconds=12)
+async def ema_sentinel_loop():
+    """Monitors user-registered EMA watches and alerts when EMAs touch, intersect, or form clean setups."""
+    try:
+        active_watches = paper_trader.get_all_active_ema_watches()
+        if not active_watches:
+            return
+
+        now = time.time()
+        for watch in active_watches:
+            df = await mexc_client.get_klines(watch.symbol, interval=watch.timeframe, limit=210)
+            if df is None or len(df) < 55:
+                continue
+
+            ema9 = CryptoAnalyzer.calculate_ema(df["close"], 9)
+            ema21 = CryptoAnalyzer.calculate_ema(df["close"], 21)
+            ema50 = CryptoAnalyzer.calculate_ema(df["close"], 50)
+            ema200 = CryptoAnalyzer.calculate_ema(df["close"], 200) if len(df) >= 200 else ema50
+
+            e9 = float(ema9.iloc[-1])
+            e9_prev = float(ema9.iloc[-2])
+            e21 = float(ema21.iloc[-1])
+            e21_prev = float(ema21.iloc[-2])
+            e50 = float(ema50.iloc[-1])
+            e50_prev = float(ema50.iloc[-2])
+            e200 = float(ema200.iloc[-1])
+            e200_prev = float(ema200.iloc[-2])
+
+            curr_p = float(df["close"].iloc[-1])
+            high_p = float(df["high"].iloc[-1])
+            low_p = float(df["low"].iloc[-1])
+            prev_close = float(df["close"].iloc[-2])
+
+            event_type = None
+            event_title = None
+            what_it_means = None
+            action_advice = None
+            embed_color = 0xE67E22
+
+            # 1. Macro 200 Cross (Yellow crosses Purple)
+            if e9_prev >= e200_prev and e9 < e200:
+                event_type = "DEATH_CROSS_200"
+                event_title = "🚨 MACRO FLOOR BROKEN: Yellow (9) Crossed Below Purple (200)!"
+                what_it_means = (
+                    "• The 200 EMA support floor has failed.\n"
+                    "• The trend has officially flipped from Bullish to **BEAR REGIME 🔴**.\n"
+                    "• The Purple line is now a **moving ceiling (resistance)**."
+                )
+                action_advice = (
+                    "• **DO NOT BUY/LONG.**\n"
+                    "• Wait for price to bounce slightly towards the Yellow (9) or Green (21) line, then **ENTER SHORT 🔴**!"
+                )
+                embed_color = config.COLOR_STRONG_SELL
+
+            elif e9_prev <= e200_prev and e9 > e200:
+                event_type = "GOLDEN_CROSS_200"
+                event_title = "🚀 MACRO CEILING BROKEN: Yellow (9) Crossed Above Purple (200)!"
+                what_it_means = (
+                    "• Price reclaimed the 200 EMA ceiling.\n"
+                    "• The trend has officially flipped from Bearish to **BULL REGIME 🟢**.\n"
+                    "• The Purple line is now your **safety trampoline floor**."
+                )
+                action_advice = (
+                    "• **DO NOT SHORT.**\n"
+                    "• Wait for price to dip slightly into the Green (21) line, then **ENTER LONG 🟢**!"
+                )
+                embed_color = config.COLOR_STRONG_BUY
+
+            # 2. Short-term Cross (Yellow crosses Green)
+            elif e9_prev >= e21_prev and e9 < e21:
+                event_type = "CROSS_9_UNDER_21"
+                event_title = "⚠️ MOMENTUM LOSS: Yellow (9) Crossed Below Green (21)"
+                what_it_means = (
+                    "• Short-term upward momentum died.\n"
+                    "• Price is pulling back deeper towards the 50 or 200 EMA."
+                )
+                action_advice = (
+                    "• If holding a Long, consider locking in profit or tightening Stop Loss.\n"
+                    "• Wait for the pullback to finish before looking to re-enter."
+                )
+                embed_color = 0xE74C3C
+
+            elif e9_prev <= e21_prev and e9 > e21:
+                event_type = "CROSS_9_OVER_21"
+                event_title = "⚡ BULLISH MOMENTUM TRIGGER: Yellow (9) Crossed Above Green (21)"
+                what_it_means = (
+                    "• Buyers are aggressively stepping in.\n"
+                    "• Fast momentum has flipped back to the upside."
+                )
+                action_advice = (
+                    "• If Purple (200) is below, this is a high-probability signal for trend continuation!\n"
+                    "• Look for scalp Long opportunities."
+                )
+                embed_color = 0x2ECC71
+
+            # 3. Pullback Touch into 21 EMA
+            elif curr_p < e200 and (low_p <= e21 <= high_p or abs(curr_p - e21) / curr_p <= 0.0008):
+                event_type = "TOUCH_21_BEAR"
+                event_title = "🎯 PULLBACK SWEET SPOT: Price Touched Green 21 EMA!"
+                what_it_means = (
+                    "• In a Bear Regime, the Green 21 EMA acts as dynamic resistance.\n"
+                    "• The relief bounce reached the value zone (rubber band snapped back)."
+                )
+                action_advice = (
+                    "• **WATCH THE 1M CANDLE CLOSE!**\n"
+                    "• If it leaves an upper rejection wick and closes **RED** ➔ **CLICK SHORT 🔴**!\n"
+                    "• Stop Loss: 2 ticks above the Green line."
+                )
+                embed_color = 0x9B59B6
+
+            elif curr_p > e200 and (low_p <= e21 <= high_p or abs(curr_p - e21) / curr_p <= 0.0008):
+                event_type = "TOUCH_21_BULL"
+                event_title = "🎯 DIP SWEET SPOT: Price Touched Green 21 EMA!"
+                what_it_means = (
+                    "• In a Bull Regime, the Green 21 EMA acts as dynamic support.\n"
+                    "• Price finished its healthy dip and is testing the trampoline."
+                )
+                action_advice = (
+                    "• **WATCH THE 1M CANDLE CLOSE!**\n"
+                    "• If it leaves a bottom bounce wick and closes **GREEN** ➔ **CLICK LONG 🟢**!\n"
+                    "• Stop Loss: 2 ticks below the Green line."
+                )
+                embed_color = 0x3498DB
+
+            # 4. Piercing Warning (Candle broke above 21 in bear regime)
+            elif curr_p < e200 and curr_p > e21 and prev_close <= e21:
+                event_type = "PIERCE_21_BEAR"
+                event_title = "⚠️ CAUTION: Candle Broke ABOVE Green 21 EMA!"
+                what_it_means = (
+                    "• The Green 21 EMA ceiling was breached by buyers.\n"
+                    "• The pullback is extending higher towards the **Blue 50 EMA**."
+                )
+                action_advice = (
+                    "• **DO NOT SHORT YET!** Wait for price to reach the Blue 50 EMA ceiling before looking for rejection."
+                )
+                embed_color = 0xF39C12
+
+            # Dispatch notification if new event or 3 mins cooldown elapsed
+            if event_type:
+                is_new_event = event_type != watch.last_event
+                is_cooldown_ready = (now - watch.last_alert_time) > 180
+
+                if is_new_event or is_cooldown_ready:
+                    ch = bot.get_channel(watch.channel_id)
+                    if ch:
+                        embed = build_ema_alert_embed(
+                            symbol=watch.symbol,
+                            timeframe=watch.timeframe,
+                            event_title=event_title,
+                            what_it_means=what_it_means,
+                            action_advice=action_advice,
+                            curr_p=curr_p,
+                            e9=e9,
+                            e21=e21,
+                            e50=e50,
+                            e200=e200,
+                            color=embed_color,
+                        )
+                        await ch.send(
+                            content=f"🔔 <@{watch.user_id}> **EMA Auto-Alert for {watch.symbol}!**",
+                            embed=embed,
+                        )
+                        paper_trader.update_ema_watch_event(watch.id, event_type)
+                        logger.info(f"Sent EMA Alert {event_type} for {watch.symbol} to user {watch.user_id}")
+
+    except Exception as e:
+        logger.error(f"Error in ema_sentinel_loop: {e}")
+
+
 # ==================== DUAL-TIMEFRAME AUTOMATED SCANNER ====================
 
 @tasks.loop(minutes=1)
@@ -2606,6 +2906,11 @@ async def before_tp_sl():
 
 @active_trade_copilot_loop.before_loop
 async def before_copilot():
+    await bot.wait_until_ready()
+
+
+@ema_sentinel_loop.before_loop
+async def before_ema_sentinel():
     await bot.wait_until_ready()
 
 

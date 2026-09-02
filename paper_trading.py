@@ -32,6 +32,19 @@ class TrackedTrade:
     liquidation_price: Optional[float] = None
 
 
+@dataclass
+class EMAWatch:
+    id: int
+    user_id: str
+    user_name: str
+    channel_id: int
+    symbol: str
+    timeframe: str
+    last_event: str
+    last_alert_time: float
+    is_active: int
+
+
 def calculate_liquidation_price(entry_price: float, direction: str, leverage: int = 1) -> float:
     """
     Calculates estimated futures liquidation price with ~0.5% MEXC maintenance margin rate.
@@ -185,6 +198,23 @@ class PaperTradingManager:
                     cursor.execute(f"ALTER TABLE tracked_trades ADD COLUMN {col_def[0]} {col_def[1]}")
                 except sqlite3.OperationalError:
                     pass
+
+            # Real-Time EMA Auto-Notifier Watches Table
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ema_watches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT,
+                    user_name TEXT,
+                    channel_id INTEGER,
+                    symbol TEXT,
+                    timeframe TEXT DEFAULT '1m',
+                    last_event TEXT DEFAULT '',
+                    last_alert_time REAL DEFAULT 0,
+                    is_active INTEGER DEFAULT 1
+                )
+                """
+            )
             conn.commit()
 
     def start_trade_tracking(
@@ -331,6 +361,101 @@ class PaperTradingManager:
                     )
                 )
             return trades
+
+    def start_ema_watch(
+        self,
+        user_id: str,
+        user_name: str,
+        channel_id: int,
+        symbol: str,
+        timeframe: str = "1m",
+    ) -> Tuple[bool, str, EMAWatch]:
+        now = time.time()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE ema_watches SET is_active = 0 WHERE user_id = ? AND is_active = 1", (user_id,))
+            cursor.execute(
+                """
+                INSERT INTO ema_watches (user_id, user_name, channel_id, symbol, timeframe, last_event, last_alert_time, is_active)
+                VALUES (?, ?, ?, ?, ?, '', 0, 1)
+                """,
+                (user_id, user_name, channel_id, symbol, timeframe),
+            )
+            watch_id = cursor.lastrowid
+            conn.commit()
+            watch = EMAWatch(
+                id=watch_id,
+                user_id=user_id,
+                user_name=user_name,
+                channel_id=channel_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                last_event="",
+                last_alert_time=0.0,
+                is_active=1,
+            )
+            return True, f"🔔 **EMA Auto-Notifier ENGAGED for {symbol} on `{timeframe}`!**\nYou will be automatically alerted whenever EMAs cross, touch, or trigger sniper setups.", watch
+
+    def stop_ema_watch(self, user_id: str) -> Tuple[bool, str]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, symbol, timeframe FROM ema_watches WHERE user_id = ? AND is_active = 1", (user_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False, "You do not have any active EMA Auto-Notifier running."
+            cursor.execute("UPDATE ema_watches SET is_active = 0 WHERE user_id = ? AND is_active = 1", (user_id,))
+            conn.commit()
+            return True, f"🛑 **EMA Auto-Notifier DISENGAGED** for **{row['symbol']} ({row['timeframe']})**. Automated alerts have been stopped!"
+
+    def get_active_ema_watch(self, user_id: str) -> Optional[EMAWatch]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM ema_watches WHERE user_id = ? AND is_active = 1 ORDER BY id DESC LIMIT 1", (user_id,))
+            r = cursor.fetchone()
+            if not r:
+                return None
+            return EMAWatch(
+                id=r["id"],
+                user_id=r["user_id"],
+                user_name=r["user_name"],
+                channel_id=r["channel_id"],
+                symbol=r["symbol"],
+                timeframe=r["timeframe"],
+                last_event=r["last_event"] or "",
+                last_alert_time=r["last_alert_time"] or 0.0,
+                is_active=r["is_active"],
+            )
+
+    def get_all_active_ema_watches(self) -> List[EMAWatch]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM ema_watches WHERE is_active = 1 ORDER BY id DESC")
+            rows = cursor.fetchall()
+            watches = []
+            for r in rows:
+                watches.append(
+                    EMAWatch(
+                        id=r["id"],
+                        user_id=r["user_id"],
+                        user_name=r["user_name"],
+                        channel_id=r["channel_id"],
+                        symbol=r["symbol"],
+                        timeframe=r["timeframe"],
+                        last_event=r["last_event"] or "",
+                        last_alert_time=r["last_alert_time"] or 0.0,
+                        is_active=r["is_active"],
+                    )
+                )
+            return watches
+
+    def update_ema_watch_event(self, watch_id: int, last_event: str):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE ema_watches SET last_event = ?, last_alert_time = ? WHERE id = ?",
+                (last_event, time.time(), watch_id),
+            )
+            conn.commit()
 
     def update_tracked_trade_stats(self, track_id: int, current_price: float, advice: str, update_notified: bool = False):
         with self._get_connection() as conn:
