@@ -69,12 +69,12 @@ def get_embed_color(signal: str) -> int:
 
 
 async def fetch_current_price(symbol: str) -> Optional[float]:
+    price = await mexc_client.get_realtime_price(symbol)
+    if price is not None and price > 0:
+        return price
     ticker = await mexc_client.get_24hr_ticker(symbol)
     if ticker and "lastPrice" in ticker:
         return float(ticker["lastPrice"])
-    df = await mexc_client.get_klines(symbol, interval="1m", limit=2)
-    if df is not None and len(df) > 0:
-        return float(df["close"].iloc[-1])
     return None
 
 

@@ -335,12 +335,74 @@ class MEXCClient:
 
         return None
 
+    async def get_realtime_price(self, symbol: str) -> Optional[float]:
+        """
+        Fetches the ultra-low latency real-time live price directly from MEXC
+        (Futures contract lastPrice or Spot real-time trade ticker).
+        """
+        disp, spot_sym, contract_sym = resolve_symbols(symbol)
+        session = await self._get_session()
+        is_commodity = any(k in symbol.upper() for k in ["GOLD", "XAU", "SILVER", "XAG"])
+
+        # 1. Prioritize Futures Contract ticker for Commodities & Futures
+        try:
+            async with session.get(f"{MEXC_CONTRACT_API_BASE}/ticker", params={"symbol": contract_sym}) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    cdata = res.get("data", {})
+                    if cdata and "lastPrice" in cdata:
+                        p = float(cdata["lastPrice"])
+                        if p > 0:
+                            return p
+        except Exception:
+            pass
+
+        # 2. Try Spot real-time ticker/price (instant sub-second trade execution price)
+        if not is_commodity:
+            try:
+                async with session.get(f"{MEXC_SPOT_API_BASE}/ticker/price", params={"symbol": spot_sym}) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if isinstance(data, dict) and "price" in data:
+                            p = float(data["price"])
+                            if p > 0:
+                                return p
+            except Exception:
+                pass
+
+        # 3. Fallback to latest 1m kline close
+        df = await self.get_klines(symbol, interval="1m", limit=2)
+        if df is not None and len(df) > 0:
+            return float(df["close"].iloc[-1])
+
+        return None
+
     async def get_24hr_ticker(self, symbol: str) -> Optional[Dict[str, Any]]:
         """Fetches 24-hour ticker statistics from Spot or Futures."""
         session = await self._get_session()
         disp, spot_sym, contract_sym = resolve_symbols(symbol)
+        is_commodity = any(k in symbol.upper() for k in ["GOLD", "XAU", "SILVER", "XAG"])
 
-        # 1. Try Spot Ticker
+        # 1. Prioritize Contract Ticker for Commodities
+        if is_commodity:
+            try:
+                async with session.get(f"{MEXC_CONTRACT_API_BASE}/ticker", params={"symbol": contract_sym}) as resp:
+                    if resp.status == 200:
+                        res = await resp.json()
+                        cdata = res.get("data", {})
+                        if cdata and "lastPrice" in cdata:
+                            return {
+                                "symbol": cdata.get("symbol"),
+                                "priceChangePercent": float(cdata.get("riseFallRate", 0)) * 100,
+                                "highPrice": float(cdata.get("high24Price", 0)),
+                                "lowPrice": float(cdata.get("lower24Price", 0)),
+                                "volume": float(cdata.get("volume24", 0)),
+                                "lastPrice": float(cdata.get("lastPrice", 0)),
+                            }
+            except Exception:
+                pass
+
+        # 2. Try Spot Ticker
         try:
             async with session.get(f"{MEXC_SPOT_API_BASE}/ticker/24hr", params={"symbol": spot_sym}) as resp:
                 if resp.status == 200:
@@ -350,13 +412,13 @@ class MEXCClient:
         except Exception:
             pass
 
-        # 2. Try Contract Ticker
+        # 3. Fallback to Contract Ticker for crypto
         try:
             async with session.get(f"{MEXC_CONTRACT_API_BASE}/ticker", params={"symbol": contract_sym}) as resp:
                 if resp.status == 200:
                     res = await resp.json()
                     cdata = res.get("data", {})
-                    if cdata:
+                    if cdata and "lastPrice" in cdata:
                         return {
                             "symbol": cdata.get("symbol"),
                             "priceChangePercent": float(cdata.get("riseFallRate", 0)) * 100,
