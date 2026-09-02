@@ -12,7 +12,7 @@ from discord.ext import commands, tasks
 
 import config
 from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, resolve_symbols
-from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus
+from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus, SafeEntrySetup
 from chart_generator import ChartGenerator
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade
 
@@ -291,6 +291,59 @@ def build_forecast_embed(forecast: MultiHorizonForecast) -> discord.Embed:
     )
 
     embed.set_footer(text="Multi-horizon alignment ensures you only enter when higher timeframes support the trade")
+    return embed
+
+
+def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
+    is_long = "LONG" in setup.direction
+    color = config.COLOR_STRONG_BUY if is_long else config.COLOR_STRONG_SELL
+
+    embed = discord.Embed(
+        title=f"🛡️ SNIPER SAFE ENTRY & LEVERAGE ADVISOR: {setup.symbol}",
+        color=color,
+        description=(
+            f"**Current Price:** `${setup.current_price:,.2f}` • **Confidence:** `{setup.confidence}%`\n"
+            f"**Strategy Bias:** **`{setup.direction}`**"
+        ),
+    )
+
+    # 1. Sniper Safe Entry Zone
+    embed.add_field(
+        name="🎯 Institutional Safe Entry Floor (Limit Order Zone)",
+        value=(
+            f"### **`{setup.safe_entry_zone}`**\n"
+            f"• **Distance from Market:** `{setup.distance_to_entry_pct:.2f}%` away\n"
+            f"• **Why Safe:** _{setup.entry_rationale}_\n"
+            f"• {setup.order_book_wall_note}"
+        ),
+        inline=False,
+    )
+
+    # 2. Risk Management & Targets
+    embed.add_field(
+        name="🛑 Risk Management & Take Profit Targets",
+        value=(
+            f"• **Technical Stop Loss (SL):** **`${setup.stop_loss:,.2f}`** (`{setup.sl_risk_pct:.2f}%` risk)\n"
+            f"• **🎯 Target 1 (TP1):** **`${setup.take_profit_1:,.2f}`** (**`+{setup.tp1_gain_pct:.2f}%`**)\n"
+            f"• **🚀 Target 2 (TP2):** **`${setup.take_profit_2:,.2f}`** (**`+{setup.tp2_gain_pct:.2f}%`**)\n"
+            f"• **Risk/Reward Ratio:** `{setup.risk_reward}`"
+        ),
+        inline=False,
+    )
+
+    # 3. Leverage Safety Audit & Liquidation Guardrail
+    lev_val = (
+        f"• 🟢 **Recommended Safe Leverage:** **`{setup.recommended_safe_leverage}x`**\n"
+        f"  ➔ _Est. Liq Price: `${setup.safe_liq_price:,.2f}` (**`{setup.safe_liq_buffer_pct:.1f}%`** safe buffer below market)_\n"
+        f"• 🟡 **Moderate Leverage:** `{setup.moderate_leverage}x` (Liq Price: `${setup.moderate_liq_price:,.2f}`)\n"
+        f"• 🔴 **DANGER ZONE ({setup.danger_leverage_threshold}x+):** **DO NOT USE**. Liquidation sits inside standard daily wick range!"
+    )
+    embed.add_field(name="⚡ Leverage Safety Audit (Prevent Liquidation)", value=lev_val, inline=False)
+
+    # 4. Stop-Hunt Status
+    embed.add_field(name="🦈 Whale Stop-Hunt & Liquidity Sweep Tracker", value=setup.liquidity_sweep_status, inline=False)
+
+    embed.set_footer(text="Never market-chase green/red candles • Place post-only limit orders in the safe entry zone")
     return embed
 
 
@@ -880,6 +933,35 @@ async def forecast_command(interaction: discord.Interaction, symbol: str):
         await interaction.followup.send(embed=embed, view=view)
     except Exception as e:
         logger.error(f"Error in /forecast: {e}")
+        await interaction.followup.send(f"❌ Error: `{str(e)}`", ephemeral=True)
+
+
+@bot.tree.command(name="safeentry", description="🛡️ Sniper Safe Entry: Demand/Supply zone, Stop-Hunt tracker & Max Safe Leverage to avoid liquidation.")
+@app_commands.describe(symbol="Asset symbol (e.g. BTC/USDT, GOLD, ETH/USDT, SOL/USDT)")
+async def safeentry_command(interaction: discord.Interaction, symbol: str):
+    await interaction.response.defer(thinking=True)
+    disp = format_display_symbol(symbol)
+    try:
+        df_5m = await mexc_client.get_klines(symbol, interval="5m", limit=80)
+        df_4h = await mexc_client.get_klines(symbol, interval="4h", limit=80)
+        depth = await mexc_client.get_order_book_depth(symbol, limit=20)
+        flow = await mexc_client.get_market_trades_flow(symbol, limit=50)
+
+        if df_5m is None or len(df_5m) < 30:
+            await interaction.followup.send(f"❌ Could not fetch market data for `{disp}` from MEXC.", ephemeral=True)
+            return
+
+        setup = CryptoAnalyzer.generate_safe_entry_setup(df_5m, df_4h, disp, depth=depth, flow=flow)
+        if not setup:
+            await interaction.followup.send(f"❌ Failed to calculate safe entry setup for `{disp}`.", ephemeral=True)
+            return
+
+        embed = build_safe_entry_embed(setup)
+        target_entry = setup.safe_entry_low if "LONG" in setup.direction else setup.safe_entry_high
+        view = QuickTradeView(disp, target_entry, sl=setup.stop_loss, tp=setup.take_profit_1)
+        await interaction.followup.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"Error in /safeentry: {e}")
         await interaction.followup.send(f"❌ Error: `{str(e)}`", ephemeral=True)
 
 
@@ -1698,6 +1780,31 @@ async def prefix_forecast(ctx: commands.Context, symbol: str = "BTC/USDT"):
 
         embed = build_forecast_embed(forecast)
         view = QuickTradeView(disp, forecast.current_price, sl=forecast.macro_invalidation, tp=forecast.mid_term.projected_target)
+        await ctx.send(embed=embed, view=view)
+
+
+@bot.command(name="safeentry", aliases=["safe", "sniper", "entryzone", "safety"])
+async def prefix_safeentry(ctx: commands.Context, symbol: str = "BTC/USDT"):
+    """Usage: !safeentry BTC or !safeentry GOLD"""
+    disp = format_display_symbol(symbol)
+    async with ctx.typing():
+        df_5m = await mexc_client.get_klines(symbol, interval="5m", limit=80)
+        df_4h = await mexc_client.get_klines(symbol, interval="4h", limit=80)
+        depth = await mexc_client.get_order_book_depth(symbol, limit=20)
+        flow = await mexc_client.get_market_trades_flow(symbol, limit=50)
+
+        if df_5m is None or len(df_5m) < 30:
+            await ctx.send(f"❌ Could not fetch market data for `{disp}` from MEXC.")
+            return
+
+        setup = CryptoAnalyzer.generate_safe_entry_setup(df_5m, df_4h, disp, depth=depth, flow=flow)
+        if not setup:
+            await ctx.send(f"❌ Failed to calculate safe entry setup for `{disp}`.")
+            return
+
+        embed = build_safe_entry_embed(setup)
+        target_entry = setup.safe_entry_low if "LONG" in setup.direction else setup.safe_entry_high
+        view = QuickTradeView(disp, target_entry, sl=setup.stop_loss, tp=setup.take_profit_1)
         await ctx.send(embed=embed, view=view)
 
 
