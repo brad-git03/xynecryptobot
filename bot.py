@@ -381,6 +381,7 @@ def build_ema_alert_embed(
     symbol: str,
     timeframe: str,
     event_title: str,
+    verdict_badge: str,
     what_it_means: str,
     action_advice: str,
     curr_p: float,
@@ -395,6 +396,12 @@ def build_ema_alert_embed(
         color=color,
         description=f"### {event_title}\n**Live Price:** `${curr_p:,.2f}`",
     )
+    if verdict_badge:
+        embed.add_field(
+            name="🚦 Real-Time Entry Verdict",
+            value=verdict_badge,
+            inline=False,
+        )
     embed.add_field(
         name="💡 What This Indicates",
         value=what_it_means,
@@ -2639,6 +2646,7 @@ async def ema_sentinel_loop():
 
             event_type = None
             event_title = None
+            verdict_badge = None
             what_it_means = None
             action_advice = None
             embed_color = 0xE67E22
@@ -2647,6 +2655,7 @@ async def ema_sentinel_loop():
             if e9_prev >= e200_prev and e9 < e200:
                 event_type = "DEATH_CROSS_200"
                 event_title = "🚨 MACRO FLOOR BROKEN: Yellow (9) Crossed Below Purple (200)!"
+                verdict_badge = "🔴 **ENTRY VERDICT: ⚠️ TREND FLIPPED TO BEAR REGIME (Look to Short on Bounces)**"
                 what_it_means = (
                     "• The 200 EMA support floor has failed.\n"
                     "• The trend has officially flipped from Bullish to **BEAR REGIME 🔴**.\n"
@@ -2661,6 +2670,7 @@ async def ema_sentinel_loop():
             elif e9_prev <= e200_prev and e9 > e200:
                 event_type = "GOLDEN_CROSS_200"
                 event_title = "🚀 MACRO CEILING BROKEN: Yellow (9) Crossed Above Purple (200)!"
+                verdict_badge = "🟢 **ENTRY VERDICT: 🚀 TREND FLIPPED TO BULL REGIME (Look to Long on Dips)**"
                 what_it_means = (
                     "• Price reclaimed the 200 EMA ceiling.\n"
                     "• The trend has officially flipped from Bearish to **BULL REGIME 🟢**.\n"
@@ -2672,37 +2682,52 @@ async def ema_sentinel_loop():
                 )
                 embed_color = config.COLOR_STRONG_BUY
 
-            # 2. Short-term Cross (Yellow crosses Green)
-            elif e9_prev >= e21_prev and e9 < e21:
-                event_type = "CROSS_9_UNDER_21"
-                event_title = "⚠️ MOMENTUM LOSS: Yellow (9) Crossed Below Green (21)"
+            # 2. High-Conviction Full Alignment Prime Entries (ALL SYSTEMS GO!)
+            elif e200 > e50 and e50 > e21 and e21 > e9 and curr_p < e9 and curr_p <= prev_close:
+                event_type = "PRIME_SHORT_NOW"
+                event_title = "🚀 PRIME SHORT OPPORTUNITY: Full Bearish Waterfall Active! 🔴"
+                verdict_badge = "🔴 **ENTRY VERDICT: ✅ 100% GOOD TO SHORT NOW! (Full Confluence)**"
+                sl_calc = e21 * 1.002
+                tp1_calc = curr_p * 0.993
+                tp2_calc = curr_p * 0.985
                 what_it_means = (
-                    "• Short-term upward momentum died.\n"
-                    "• Price is pulling back deeper towards the 50 or 200 EMA."
+                    "• All 4 EMAs are in textbook descending order (`200 > 50 > 21 > 9`).\n"
+                    "• Price is riding below the 9 EMA slide with sellers in full control.\n"
+                    "• Pullbacks are being aggressively absorbed by bears."
                 )
                 action_advice = (
-                    "• If holding a Long, consider locking in profit or tightening Stop Loss.\n"
-                    "• Wait for the pullback to finish before looking to re-enter."
+                    f"• **ENTER SHORT 🔴** around `${curr_p:,.2f}`!\n"
+                    f"• 🛑 **Stop Loss (SL)**: `${sl_calc:,.2f}` (2 ticks above Green 21 EMA)\n"
+                    f"• 🎯 **Target 1 (TP1)**: `${tp1_calc:,.2f}` (`+0.70%`)\n"
+                    f"• 🚀 **Target 2 (TP2)**: `${tp2_calc:,.2f}` (`+1.50%`)"
                 )
-                embed_color = 0xE74C3C
+                embed_color = config.COLOR_STRONG_SELL
 
-            elif e9_prev <= e21_prev and e9 > e21:
-                event_type = "CROSS_9_OVER_21"
-                event_title = "⚡ BULLISH MOMENTUM TRIGGER: Yellow (9) Crossed Above Green (21)"
+            elif e9 > e21 and e21 > e50 and e50 > e200 and curr_p > e9 and curr_p >= prev_close:
+                event_type = "PRIME_LONG_NOW"
+                event_title = "🚀 PRIME LONG OPPORTUNITY: Full Bullish Rainbow Active! 🟢"
+                verdict_badge = "🟢 **ENTRY VERDICT: ✅ 100% GOOD TO LONG NOW! (Full Confluence)**"
+                sl_calc = e21 * 0.998
+                tp1_calc = curr_p * 1.007
+                tp2_calc = curr_p * 1.015
                 what_it_means = (
-                    "• Buyers are aggressively stepping in.\n"
-                    "• Fast momentum has flipped back to the upside."
+                    "• All 4 EMAs are in textbook ascending order (`9 > 21 > 50 > 200`).\n"
+                    "• Price is surfing above the 9 EMA with buyers in full control.\n"
+                    "• Dips are being aggressively defended."
                 )
                 action_advice = (
-                    "• If Purple (200) is below, this is a high-probability signal for trend continuation!\n"
-                    "• Look for scalp Long opportunities."
+                    f"• **ENTER LONG 🟢** around `${curr_p:,.2f}`!\n"
+                    f"• 🛑 **Stop Loss (SL)**: `${sl_calc:,.2f}` (2 ticks below Green 21 EMA)\n"
+                    f"• 🎯 **Target 1 (TP1)**: `${tp1_calc:,.2f}` (`+0.70%`)\n"
+                    f"• 🚀 **Target 2 (TP2)**: `${tp2_calc:,.2f}` (`+1.50%`)"
                 )
-                embed_color = 0x2ECC71
+                embed_color = config.COLOR_STRONG_BUY
 
-            # 3. Pullback Touch into 21 EMA
+            # 3. Pullback Touch into 21 EMA (Sniper Watch)
             elif curr_p < e200 and (low_p <= e21 <= high_p or abs(curr_p - e21) / curr_p <= 0.0008):
                 event_type = "TOUCH_21_BEAR"
                 event_title = "🎯 PULLBACK SWEET SPOT: Price Touched Green 21 EMA!"
+                verdict_badge = "⏳ **ENTRY VERDICT: ⏳ WATCH CANDLE CLOSE TO SHORT (Look for Red Rejection)**"
                 what_it_means = (
                     "• In a Bear Regime, the Green 21 EMA acts as dynamic resistance.\n"
                     "• The relief bounce reached the value zone (rubber band snapped back)."
@@ -2717,6 +2742,7 @@ async def ema_sentinel_loop():
             elif curr_p > e200 and (low_p <= e21 <= high_p or abs(curr_p - e21) / curr_p <= 0.0008):
                 event_type = "TOUCH_21_BULL"
                 event_title = "🎯 DIP SWEET SPOT: Price Touched Green 21 EMA!"
+                verdict_badge = "⏳ **ENTRY VERDICT: ⏳ WATCH CANDLE CLOSE TO LONG (Look for Green Bounce)**"
                 what_it_means = (
                     "• In a Bull Regime, the Green 21 EMA acts as dynamic support.\n"
                     "• Price finished its healthy dip and is testing the trampoline."
@@ -2728,10 +2754,40 @@ async def ema_sentinel_loop():
                 )
                 embed_color = 0x3498DB
 
-            # 4. Piercing Warning (Candle broke above 21 in bear regime)
+            # 4. Short-term Cross (Yellow crosses Green)
+            elif e9_prev >= e21_prev and e9 < e21:
+                event_type = "CROSS_9_UNDER_21"
+                event_title = "⚠️ MOMENTUM LOSS: Yellow (9) Crossed Below Green (21)"
+                verdict_badge = "⚠️ **ENTRY VERDICT: ⏳ DO NOT LONG (Upward Momentum Died)**"
+                what_it_means = (
+                    "• Short-term upward momentum died.\n"
+                    "• Price is pulling back deeper towards the 50 or 200 EMA."
+                )
+                action_advice = (
+                    "• If holding a Long, consider locking in profit or tightening Stop Loss.\n"
+                    "• Wait for the pullback to finish before looking to re-enter."
+                )
+                embed_color = 0xE74C3C
+
+            elif e9_prev <= e21_prev and e9 > e21:
+                event_type = "CROSS_9_OVER_21"
+                event_title = "⚡ BULLISH MOMENTUM TRIGGER: Yellow (9) Crossed Above Green (21)"
+                verdict_badge = "⚡ **ENTRY VERDICT: 🟢 BULLISH MOMENTUM FLIP (Check 200 EMA)**"
+                what_it_means = (
+                    "• Buyers are aggressively stepping in.\n"
+                    "• Fast momentum has flipped back to the upside."
+                )
+                action_advice = (
+                    "• If Purple (200) is below, this is a high-probability signal for trend continuation!\n"
+                    "• Look for scalp Long opportunities."
+                )
+                embed_color = 0x2ECC71
+
+            # 5. Piercing Warning (Candle broke above 21 in bear regime)
             elif curr_p < e200 and curr_p > e21 and prev_close <= e21:
                 event_type = "PIERCE_21_BEAR"
                 event_title = "⚠️ CAUTION: Candle Broke ABOVE Green 21 EMA!"
+                verdict_badge = "🛑 **ENTRY VERDICT: ⏳ DO NOT SHORT YET (Bounce Extending to 50 EMA)**"
                 what_it_means = (
                     "• The Green 21 EMA ceiling was breached by buyers.\n"
                     "• The pullback is extending higher towards the **Blue 50 EMA**."
@@ -2753,6 +2809,7 @@ async def ema_sentinel_loop():
                             symbol=watch.symbol,
                             timeframe=watch.timeframe,
                             event_title=event_title,
+                            verdict_badge=verdict_badge,
                             what_it_means=what_it_means,
                             action_advice=action_advice,
                             curr_p=curr_p,
