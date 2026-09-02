@@ -101,14 +101,12 @@ class MEXCClient:
         disp, spot_sym, contract_sym = resolve_symbols(symbol)
         session = await self._get_session()
 
-        # 1. If it's a commodity (Gold/Silver), prioritize Contract/Futures endpoint
-        is_commodity = any(k in symbol.upper() for k in ["GOLD", "XAU", "SILVER", "XAG"])
-        if is_commodity:
-            df_contract = await self._get_contract_klines(contract_sym, interval, limit)
-            if df_contract is not None and len(df_contract) >= 30:
-                return df_contract
+        # 1. Prioritize MEXC Perpetual Futures / Contract API (matches live futures trading screen)
+        df_contract = await self._get_contract_klines(contract_sym, interval, limit)
+        if df_contract is not None and len(df_contract) >= 30:
+            return df_contract
 
-        # 2. Try Spot API
+        # 2. Fallback to Spot API for spot-only pairs
         spot_interval = SPOT_INTERVAL_MAP.get(interval, interval)
         try:
             async with session.get(
@@ -138,8 +136,7 @@ class MEXCClient:
         except Exception as e:
             logger.debug(f"Spot klines failed for {symbol}: {e}")
 
-        # 3. Fallback to Contract / Futures API (e.g. BTC_USDT, SOL_USDT)
-        return await self._get_contract_klines(contract_sym, interval, limit)
+        return None
 
     async def _get_contract_klines(
         self, contract_symbol: str, interval: str = "5m", limit: int = 120
@@ -184,44 +181,12 @@ class MEXCClient:
     async def get_order_book_depth(self, symbol: str, limit: int = 20) -> Optional[Dict[str, Any]]:
         """
         Fetches live order book bids/asks and calculates buyer/seller liquidity depth imbalance.
+        Prioritizes Perpetual Futures order book to match user's futures screen.
         """
         disp, spot_sym, contract_sym = resolve_symbols(symbol)
         session = await self._get_session()
 
-        # Try Spot Depth
-        try:
-            async with session.get(f"{MEXC_SPOT_API_BASE}/depth", params={"symbol": spot_sym, "limit": limit}) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    bids = data.get("bids", [])
-                    asks = data.get("asks", [])
-                    if bids and asks:
-                        total_bid_vol = sum(float(b[1]) for b in bids)
-                        total_ask_vol = sum(float(a[1]) for a in asks)
-                        total_vol = total_bid_vol + total_ask_vol
-                        bid_pct = (total_bid_vol / total_vol * 100.0) if total_vol > 0 else 50.0
-                        ask_pct = 100.0 - bid_pct
-
-                        # Find largest support & resistance walls
-                        best_bid_wall = max(bids, key=lambda x: float(x[1]))
-                        best_ask_wall = max(asks, key=lambda x: float(x[1]))
-
-                        return {
-                            "symbol": disp,
-                            "bid_pct": bid_pct,
-                            "ask_pct": ask_pct,
-                            "total_bid_vol": total_bid_vol,
-                            "total_ask_vol": total_ask_vol,
-                            "bid_wall_price": float(best_bid_wall[0]),
-                            "bid_wall_qty": float(best_bid_wall[1]),
-                            "ask_wall_price": float(best_ask_wall[0]),
-                            "ask_wall_qty": float(best_ask_wall[1]),
-                            "imbalance": "BULLISH_DOMINANT" if bid_pct >= 58 else ("BEARISH_DOMINANT" if ask_pct >= 58 else "BALANCED"),
-                        }
-        except Exception as e:
-            logger.debug(f"Order book depth error for {symbol}: {e}")
-
-        # Fallback to Contract Depth
+        # 1. Prioritize MEXC Perpetual Contract Depth
         try:
             async with session.get(f"{MEXC_CONTRACT_API_BASE}/depth/{contract_sym}") as resp:
                 if resp.status == 200:
@@ -254,16 +219,86 @@ class MEXCClient:
         except Exception as e:
             logger.debug(f"Contract depth error for {symbol}: {e}")
 
+        # 2. Fallback to Spot Depth
+        try:
+            async with session.get(f"{MEXC_SPOT_API_BASE}/depth", params={"symbol": spot_sym, "limit": limit}) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    bids = data.get("bids", [])
+                    asks = data.get("asks", [])
+                    if bids and asks:
+                        total_bid_vol = sum(float(b[1]) for b in bids)
+                        total_ask_vol = sum(float(a[1]) for a in asks)
+                        total_vol = total_bid_vol + total_ask_vol
+                        bid_pct = (total_bid_vol / total_vol * 100.0) if total_vol > 0 else 50.0
+                        ask_pct = 100.0 - bid_pct
+
+                        # Find largest support & resistance walls
+                        best_bid_wall = max(bids, key=lambda x: float(x[1]))
+                        best_ask_wall = max(asks, key=lambda x: float(x[1]))
+
+                        return {
+                            "symbol": disp,
+                            "bid_pct": bid_pct,
+                            "ask_pct": ask_pct,
+                            "total_bid_vol": total_bid_vol,
+                            "total_ask_vol": total_ask_vol,
+                            "bid_wall_price": float(best_bid_wall[0]),
+                            "bid_wall_qty": float(best_bid_wall[1]),
+                            "ask_wall_price": float(best_ask_wall[0]),
+                            "ask_wall_qty": float(best_ask_wall[1]),
+                            "imbalance": "BULLISH_DOMINANT" if bid_pct >= 58 else ("BEARISH_DOMINANT" if ask_pct >= 58 else "BALANCED"),
+                        }
+        except Exception as e:
+            logger.debug(f"Spot depth error for {symbol}: {e}")
+
         return None
 
     async def get_market_trades_flow(self, symbol: str, limit: int = 60) -> Optional[Dict[str, Any]]:
         """
         Fetches real-time executed market trades and calculates Taker Buy/Sell Order Flow Delta.
+        Prioritizes Perpetual Futures deals to match live futures trading.
         """
         disp, spot_sym, contract_sym = resolve_symbols(symbol)
         session = await self._get_session()
 
-        # Try Spot Trades
+        # 1. Prioritize MEXC Contract Deals (Perpetual Futures)
+        try:
+            async with session.get(f"{MEXC_CONTRACT_API_BASE}/deals/{contract_sym}") as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    deals = res.get("data", [])
+                    if isinstance(deals, list) and len(deals) > 0:
+                        deals = deals[:limit]
+                        # 1 = buy, 2 = sell in MEXC contract deals; 'v' is volume, 'p' is price
+                        buy_vol = sum(float(d.get("v", d.get("vol", 0))) for d in deals if d.get("T") == 1 or d.get("side") == 1)
+                        sell_vol = sum(float(d.get("v", d.get("vol", 0))) for d in deals if d.get("T") == 2 or d.get("side") == 2)
+                        total_vol = buy_vol + sell_vol
+                        taker_buy_pct = (buy_vol / total_vol * 100.0) if total_vol > 0 else 50.0
+                        taker_sell_pct = 100.0 - taker_buy_pct
+
+                        avg_p = float(deals[0].get("p", 0)) if deals else 0.0
+                        buy_dollars = buy_vol * avg_p
+                        sell_dollars = sell_vol * avg_p
+                        net_delta_usd = buy_dollars - sell_dollars
+
+                        whale_trades = [d for d in deals if float(d.get("v", d.get("vol", 0))) * float(d.get("p", 0)) >= 10000]
+
+                        return {
+                            "symbol": disp,
+                            "taker_buy_pct": taker_buy_pct,
+                            "taker_sell_pct": taker_sell_pct,
+                            "buy_volume_usd": buy_dollars,
+                            "sell_volume_usd": sell_dollars,
+                            "net_delta_usd": net_delta_usd,
+                            "total_trades_analyzed": len(deals),
+                            "whale_trades_count": len(whale_trades),
+                            "flow_pressure": "STRONG_BUY_FLOW" if taker_buy_pct >= 60 else ("STRONG_SELL_FLOW" if taker_sell_pct >= 60 else "NEUTRAL_FLOW"),
+                        }
+        except Exception as e:
+            logger.debug(f"Contract deals error for {symbol}: {e}")
+
+        # 2. Fallback to Spot Trades
         try:
             async with session.get(f"{MEXC_SPOT_API_BASE}/trades", params={"symbol": spot_sym, "limit": limit}) as resp:
                 if resp.status == 200:
@@ -298,40 +333,6 @@ class MEXCClient:
                         }
         except Exception as e:
             logger.debug(f"Spot trades error for {symbol}: {e}")
-
-        # Fallback to Contract Deals
-        try:
-            async with session.get(f"{MEXC_CONTRACT_API_BASE}/deals/{contract_sym}") as resp:
-                if resp.status == 200:
-                    res = await resp.json()
-                    deals = res.get("data", [])
-                    if isinstance(deals, list) and len(deals) > 0:
-                        deals = deals[:limit]
-                        # 1 = buy, 2 = sell in contract deals
-                        buy_vol = sum(float(d.get("vol", 0)) for d in deals if d.get("T") == 1 or d.get("side") == 1)
-                        sell_vol = sum(float(d.get("vol", 0)) for d in deals if d.get("T") == 2 or d.get("side") == 2)
-                        total_vol = buy_vol + sell_vol
-                        taker_buy_pct = (buy_vol / total_vol * 100.0) if total_vol > 0 else 50.0
-                        taker_sell_pct = 100.0 - taker_buy_pct
-
-                        avg_p = float(deals[0].get("p", 0)) if deals else 0.0
-                        buy_dollars = buy_vol * avg_p
-                        sell_dollars = sell_vol * avg_p
-                        net_delta_usd = buy_dollars - sell_dollars
-
-                        return {
-                            "symbol": disp,
-                            "taker_buy_pct": taker_buy_pct,
-                            "taker_sell_pct": taker_sell_pct,
-                            "buy_volume_usd": buy_dollars,
-                            "sell_volume_usd": sell_dollars,
-                            "net_delta_usd": net_delta_usd,
-                            "total_trades_analyzed": len(deals),
-                            "whale_trades_count": sum(1 for d in deals if float(d.get("vol", 0)) * avg_p >= 10000),
-                            "flow_pressure": "STRONG_BUY_FLOW" if taker_buy_pct >= 60 else ("STRONG_SELL_FLOW" if taker_sell_pct >= 60 else "NEUTRAL_FLOW"),
-                        }
-        except Exception as e:
-            logger.debug(f"Contract deals error for {symbol}: {e}")
 
         return None
 
