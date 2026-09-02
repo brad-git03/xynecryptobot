@@ -294,19 +294,19 @@ def build_forecast_embed(forecast: MultiHorizonForecast) -> discord.Embed:
     return embed
 
 
-def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
+def build_safe_entry_embed(setup: SafeEntrySetup, depth: Optional[Dict[str, Any]] = None, flow: Optional[Dict[str, Any]] = None) -> discord.Embed:
     is_long = "LONG" in setup.direction
     color = config.COLOR_STRONG_BUY if is_long else config.COLOR_STRONG_SELL
 
-    # Determine real-time entry readiness
+    # Determine Real-Time Entry Readiness Status
     is_inside_zone = setup.safe_entry_low <= setup.current_price <= setup.safe_entry_high
     if is_long:
         if is_inside_zone or abs(setup.current_price - setup.safe_entry_high) / setup.current_price < 0.0015:
             entry_status_badge = "🟢 **ENTRY VERDICT: ✅ GOOD TO ENTER NOW (In Prime Buy Zone!)**"
-            entry_action_sub = "Price is currently resting directly on the institutional demand floor. Optimal risk-to-reward to open LONG!"
+            entry_action_sub = "Price is currently testing the institutional support floor. High-probability LONG entry!"
         elif setup.current_price > setup.safe_entry_high:
             entry_status_badge = "⏳ **ENTRY VERDICT: ⏳ WAIT FOR LIMIT FILL (Do NOT Market Buy)**"
-            entry_action_sub = f"Price is `{setup.distance_to_entry_pct:.2f}%` above the safe zone. Place a **Limit Buy Order** inside `{setup.safe_entry_zone}` and wait for the pullback!"
+            entry_action_sub = f"Price is `{setup.distance_to_entry_pct:.2f}%` above the safe floor. Place a **Limit Buy Order** inside `{setup.safe_entry_zone}` and wait for pullback!"
         else:
             entry_status_badge = "⚠️ **ENTRY VERDICT: ⚠️ BELOW SAFE FLOOR (Wait for Bounce Wick)**"
             entry_action_sub = "Price wicked below the standard floor. Await a 5m green candle close before entering."
@@ -336,6 +336,22 @@ def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
         value=f"{entry_status_badge}\n• _{entry_action_sub}_",
         inline=False,
     )
+
+    # Order Book Depth & Taker Flow Confluence
+    if depth or flow:
+        ob_lines = []
+        if depth:
+            bar = generate_flow_bar(depth["bid_pct"])
+            ob_lines.append(f"• **Order Book Liquidity:** {bar}")
+            ob_lines.append(f"  └ 🧱 **Support Wall:** `${depth['bid_wall_price']:,.2f}` (`{depth['bid_wall_qty']:,.0f}`) | 🧱 **Resistance Wall:** `${depth['ask_wall_price']:,.2f}` (`{depth['ask_wall_qty']:,.0f}`)")
+        if flow:
+            delta_str = f"+${flow['net_delta_usd']:,.2f}" if flow['net_delta_usd'] >= 0 else f"-${abs(flow['net_delta_usd']):,.2f}"
+            ob_lines.append(f"• **Whale Taker Flow:** **`{delta_str}`** Net Delta (`🐋 {flow['whale_trades_count']} large fills`)")
+        embed.add_field(
+            name="🌊 Live Order Book & Whale Liquidity Confluence",
+            value="\n".join(ob_lines),
+            inline=False,
+        )
 
     # 1. Sniper Safe Entry Zone
     embed.add_field(
@@ -389,6 +405,8 @@ def build_ema_alert_embed(
     e21: float,
     e50: float,
     e200: float,
+    depth: Optional[Dict[str, Any]] = None,
+    flow: Optional[Dict[str, Any]] = None,
     color: int = 0xE67E22,
 ) -> discord.Embed:
     embed = discord.Embed(
@@ -402,6 +420,23 @@ def build_ema_alert_embed(
             value=verdict_badge,
             inline=False,
         )
+
+    # Order Book & Taker Flow Confluence Field
+    if depth or flow:
+        ob_lines = []
+        if depth:
+            bar = generate_flow_bar(depth["bid_pct"])
+            ob_lines.append(f"• **Order Book Liquidity:** {bar}")
+            ob_lines.append(f"  └ 🧱 **Support Wall:** `${depth['bid_wall_price']:,.2f}` (`{depth['bid_wall_qty']:,.0f}`) | 🧱 **Resistance Wall:** `${depth['ask_wall_price']:,.2f}` (`{depth['ask_wall_qty']:,.0f}`)")
+        if flow:
+            delta_str = f"+${flow['net_delta_usd']:,.2f}" if flow['net_delta_usd'] >= 0 else f"-${abs(flow['net_delta_usd']):,.2f}"
+            ob_lines.append(f"• **Whale Taker Flow:** **`{delta_str}`** Net Delta (`🐋 {flow['whale_trades_count']} large fills`)")
+        embed.add_field(
+            name="🌊 Live Order Book & Whale Liquidity Confluence",
+            value="\n".join(ob_lines),
+            inline=False,
+        )
+
     embed.add_field(
         name="💡 What This Indicates",
         value=what_it_means,
@@ -1039,7 +1074,7 @@ async def safeentry_command(interaction: discord.Interaction, symbol: str):
             await interaction.followup.send(f"❌ Failed to calculate safe entry setup for `{disp}`.", ephemeral=True)
             return
 
-        embed = build_safe_entry_embed(setup)
+        embed = build_safe_entry_embed(setup, depth=depth, flow=flow)
         target_entry = setup.safe_entry_low if "LONG" in setup.direction else setup.safe_entry_high
         view = QuickTradeView(disp, target_entry, sl=setup.stop_loss, tp=setup.take_profit_1)
         await interaction.followup.send(embed=embed, view=view)
@@ -1185,14 +1220,26 @@ async def watchema_command(
         e50 = float(ema50.iloc[-1])
         e200 = float(ema200.iloc[-1])
         curr_p = float(df["close"].iloc[-1])
+        depth = await mexc_client.get_order_book_depth(symbol, limit=20)
+        flow = await mexc_client.get_market_trades_flow(symbol, limit=50)
 
         if e200 > e50 and e50 > e21 and e21 > e9:
             title = "🚀 BEARISH WATERFALL IN PROGRESS: Sellers in Full Control! 🔴"
-            verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
+            if depth and depth.get("bid_pct", 0) >= 60.0:
+                verdict = f"⚠️ **CAUTION: EMA BEARISH BUT WHALE BUY WALL AHEAD!**\n└ Heavy Bid Wall at `${depth['bid_wall_price']:,.2f}` ({depth['bid_pct']:.1f}% Bids). Possible bounce trap — DO NOT SHORT!"
+            elif depth and depth.get("ask_pct", 0) >= 60.0:
+                verdict = f"🔴 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION SHORT!**\n└ EMAs Bearish Waterfall + Order Book {depth['ask_pct']:.1f}% Sellers Dominant!"
+            else:
+                verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
             color = config.COLOR_STRONG_SELL
         elif e9 > e21 and e21 > e50 and e50 > e200:
             title = "🚀 BULLISH RAINBOW IN PROGRESS: Buyers in Full Control! 🟢"
-            verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
+            if depth and depth.get("ask_pct", 0) >= 60.0:
+                verdict = f"⚠️ **CAUTION: EMA BULLISH BUT WHALE SELL WALL AHEAD!**\n└ Heavy Ask Wall at `${depth['ask_wall_price']:,.2f}` ({depth['ask_pct']:.1f}% Asks). Do not buy into the ceiling!"
+            elif depth and depth.get("bid_pct", 0) >= 60.0:
+                verdict = f"🟢 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION LONG!**\n└ EMAs Bullish Rainbow + Order Book {depth['bid_pct']:.1f}% Buyers Dominant!"
+            else:
+                verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
             color = config.COLOR_STRONG_BUY
         else:
             title = "⏳ CONSOLIDATION / SQUEEZE ZONE: Awaiting Clear Trend"
@@ -1204,13 +1251,15 @@ async def watchema_command(
             timeframe=tf,
             event_title=title,
             verdict_badge=verdict,
-            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, and entry confirmations!",
+            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, order book walls & entry confirmations!",
             action_advice="• Keep your chart open on MEXC with EMA 9, 21, 50, 200.\n• Type `/stopema` or `!stopema` to disengage notifications at any time.",
             curr_p=curr_p,
             e9=e9,
             e21=e21,
             e50=e50,
             e200=e200,
+            depth=depth,
+            flow=flow,
             color=color,
         )
         await interaction.followup.send(content=msg, embed=embed)
@@ -1977,7 +2026,7 @@ async def prefix_safeentry(ctx: commands.Context, symbol: str = "BTC/USDT"):
             await ctx.send(f"❌ Failed to calculate safe entry setup for `{disp}`.")
             return
 
-        embed = build_safe_entry_embed(setup)
+        embed = build_safe_entry_embed(setup, depth=depth, flow=flow)
         target_entry = setup.safe_entry_low if "LONG" in setup.direction else setup.safe_entry_high
         view = QuickTradeView(disp, target_entry, sl=setup.stop_loss, tp=setup.take_profit_1)
         await ctx.send(embed=embed, view=view)
@@ -2013,14 +2062,26 @@ async def prefix_watchema(ctx: commands.Context, symbol: str = "ETH", timeframe:
         e50 = float(ema50.iloc[-1])
         e200 = float(ema200.iloc[-1])
         curr_p = float(df["close"].iloc[-1])
+        depth = await mexc_client.get_order_book_depth(disp, limit=20)
+        flow = await mexc_client.get_market_trades_flow(disp, limit=50)
 
         if e200 > e50 and e50 > e21 and e21 > e9:
             title = "🚀 BEARISH WATERFALL IN PROGRESS: Sellers in Full Control! 🔴"
-            verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
+            if depth and depth.get("bid_pct", 0) >= 60.0:
+                verdict = f"⚠️ **CAUTION: EMA BEARISH BUT WHALE BUY WALL AHEAD!**\n└ Heavy Bid Wall at `${depth['bid_wall_price']:,.2f}` ({depth['bid_pct']:.1f}% Bids). Possible bounce trap — DO NOT SHORT!"
+            elif depth and depth.get("ask_pct", 0) >= 60.0:
+                verdict = f"🔴 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION SHORT!**\n└ EMAs Bearish Waterfall + Order Book {depth['ask_pct']:.1f}% Sellers Dominant!"
+            else:
+                verdict = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT (Look for rejections off 9/21)**"
             color = config.COLOR_STRONG_SELL
         elif e9 > e21 and e21 > e50 and e50 > e200:
             title = "🚀 BULLISH RAINBOW IN PROGRESS: Buyers in Full Control! 🟢"
-            verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
+            if depth and depth.get("ask_pct", 0) >= 60.0:
+                verdict = f"⚠️ **CAUTION: EMA BULLISH BUT WHALE SELL WALL AHEAD!**\n└ Heavy Ask Wall at `${depth['ask_wall_price']:,.2f}` ({depth['ask_pct']:.1f}% Asks). Do not buy into the ceiling!"
+            elif depth and depth.get("bid_pct", 0) >= 60.0:
+                verdict = f"🟢 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION LONG!**\n└ EMAs Bullish Rainbow + Order Book {depth['bid_pct']:.1f}% Buyers Dominant!"
+            else:
+                verdict = "🟢 **ENTRY VERDICT: ✅ GOOD TO LONG (Look for dips to 9/21)**"
             color = config.COLOR_STRONG_BUY
         else:
             title = "⏳ CONSOLIDATION / SQUEEZE ZONE: Awaiting Clear Trend"
@@ -2032,13 +2093,15 @@ async def prefix_watchema(ctx: commands.Context, symbol: str = "ETH", timeframe:
             timeframe=tf,
             event_title=title,
             verdict_badge=verdict,
-            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, and entry confirmations!",
+            what_it_means="• Auto-Sentinel is now actively tracking this chart every 12s.\n• You will receive automated alerts on touches, crosses, order book walls & entry confirmations!",
             action_advice="• Keep your chart open on MEXC with EMA 9, 21, 50, 200.\n• Type `!stopema` to disengage notifications at any time.",
             curr_p=curr_p,
             e9=e9,
             e21=e21,
             e50=e50,
             e200=e200,
+            depth=depth,
+            flow=flow,
             color=color,
         )
         await ctx.send(content=msg, embed=embed)
@@ -2733,6 +2796,9 @@ async def ema_sentinel_loop():
             low_p = float(df["low"].iloc[-1])
             prev_close = float(df["close"].iloc[-2])
 
+            depth = await mexc_client.get_order_book_depth(watch.symbol, limit=20)
+            flow = await mexc_client.get_market_trades_flow(watch.symbol, limit=50)
+
             event_type = None
             event_title = None
             verdict_badge = None
@@ -2775,10 +2841,15 @@ async def ema_sentinel_loop():
             elif e200 > e50 and e50 > e21 and e21 > e9 and curr_p < e9 and curr_p <= prev_close:
                 event_type = "PRIME_SHORT_NOW"
                 event_title = "🚀 PRIME SHORT OPPORTUNITY: Full Bearish Waterfall Active! 🔴"
-                verdict_badge = "🔴 **ENTRY VERDICT: ✅ 100% GOOD TO SHORT NOW! (Full Confluence)**"
                 sl_calc = e21 * 1.002
                 tp1_calc = curr_p * 0.993
                 tp2_calc = curr_p * 0.985
+                if depth and depth.get("bid_pct", 0) >= 60.0:
+                    verdict_badge = f"⚠️ **CAUTION: EMA BEARISH BUT WHALE BUY WALL AHEAD!**\n└ Heavy Bid Wall at `${depth['bid_wall_price']:,.2f}` ({depth['bid_pct']:.1f}% Bids). Possible bounce trap — DO NOT SHORT!"
+                elif depth and depth.get("ask_pct", 0) >= 60.0:
+                    verdict_badge = f"🔴 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION SHORT!**\n└ EMAs Bearish Waterfall + Order Book {depth['ask_pct']:.1f}% Sellers Dominant!"
+                else:
+                    verdict_badge = "🔴 **ENTRY VERDICT: ✅ 100% GOOD TO SHORT NOW! (Full Confluence)**"
                 what_it_means = (
                     "• All 4 EMAs are in textbook descending order (`200 > 50 > 21 > 9`).\n"
                     "• Price is riding below the 9 EMA slide with sellers in full control.\n"
@@ -2795,10 +2866,15 @@ async def ema_sentinel_loop():
             elif e9 > e21 and e21 > e50 and e50 > e200 and curr_p > e9 and curr_p >= prev_close:
                 event_type = "PRIME_LONG_NOW"
                 event_title = "🚀 PRIME LONG OPPORTUNITY: Full Bullish Rainbow Active! 🟢"
-                verdict_badge = "🟢 **ENTRY VERDICT: ✅ 100% GOOD TO LONG NOW! (Full Confluence)**"
                 sl_calc = e21 * 0.998
                 tp1_calc = curr_p * 1.007
                 tp2_calc = curr_p * 1.015
+                if depth and depth.get("ask_pct", 0) >= 60.0:
+                    verdict_badge = f"⚠️ **CAUTION: EMA BULLISH BUT WHALE SELL WALL AHEAD!**\n└ Heavy Ask Wall at `${depth['ask_wall_price']:,.2f}` ({depth['ask_pct']:.1f}% Asks). Do not buy into the ceiling!"
+                elif depth and depth.get("bid_pct", 0) >= 60.0:
+                    verdict_badge = f"🟢 **ENTRY VERDICT: 🚀 100% MAXIMUM CONFIRMATION LONG!**\n└ EMAs Bullish Rainbow + Order Book {depth['bid_pct']:.1f}% Buyers Dominant!"
+                else:
+                    verdict_badge = "🟢 **ENTRY VERDICT: ✅ 100% GOOD TO LONG NOW! (Full Confluence)**"
                 what_it_means = (
                     "• All 4 EMAs are in textbook ascending order (`9 > 21 > 50 > 200`).\n"
                     "• Price is surfing above the 9 EMA with buyers in full control.\n"
@@ -2912,6 +2988,8 @@ async def ema_sentinel_loop():
                             e21=e21,
                             e50=e50,
                             e200=e200,
+                            depth=depth,
+                            flow=flow,
                             color=embed_color,
                         )
                         await ch.send(
