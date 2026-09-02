@@ -27,6 +27,25 @@ class TrackedTrade:
     last_checked_at: float
     last_notified_at: float
     is_active: int
+    leverage: int = 1
+    margin_usd: float = 0.0
+    liquidation_price: Optional[float] = None
+
+
+def calculate_liquidation_price(entry_price: float, direction: str, leverage: int = 1) -> float:
+    """
+    Calculates estimated futures liquidation price with ~0.5% MEXC maintenance margin rate.
+    """
+    if leverage <= 1:
+        return 0.0 if direction.upper() == "LONG" else round(entry_price * 1.995, 4)
+
+    mmr = 0.005  # 0.5% maintenance margin
+    if direction.upper() == "LONG":
+        liq = entry_price * (1.0 - (1.0 / leverage) + mmr)
+        return max(0.0, round(liq, 4))
+    else:  # SHORT
+        liq = entry_price * (1.0 + (1.0 / leverage) - mmr)
+        return round(liq, 4)
 
 
 @dataclass
@@ -149,10 +168,23 @@ class PaperTradingManager:
                     created_at REAL,
                     last_checked_at REAL,
                     last_notified_at REAL DEFAULT 0,
-                    is_active INTEGER DEFAULT 1
+                    is_active INTEGER DEFAULT 1,
+                    leverage INTEGER DEFAULT 1,
+                    margin_usd REAL DEFAULT 0.0,
+                    liquidation_price REAL DEFAULT 0.0
                 )
                 """
             )
+            # Automatic schema migration for existing DB
+            for col_def in [
+                ("leverage", "INTEGER DEFAULT 1"),
+                ("margin_usd", "REAL DEFAULT 0.0"),
+                ("liquidation_price", "REAL DEFAULT 0.0"),
+            ]:
+                try:
+                    cursor.execute(f"ALTER TABLE tracked_trades ADD COLUMN {col_def[0]} {col_def[1]}")
+                except sqlite3.OperationalError:
+                    pass
             conn.commit()
 
     def start_trade_tracking(
@@ -166,20 +198,25 @@ class PaperTradingManager:
         timeframe: str = "5m",
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
+        leverage: int = 1,
+        margin_usd: float = 0.0,
     ) -> Tuple[bool, str, TrackedTrade]:
         direction = direction.upper()
         if direction not in ("LONG", "SHORT"):
             return False, "Direction must be 'LONG' or 'SHORT'.", None
 
         now = time.time()
+        leverage = max(1, min(125, int(leverage)))
+        liq_price = calculate_liquidation_price(entry_price, direction, leverage)
+
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE tracked_trades SET is_active = 0 WHERE user_id = ? AND is_active = 1", (user_id,))
             
             cursor.execute(
                 """
-                INSERT INTO tracked_trades (user_id, user_name, channel_id, symbol, direction, entry_price, timeframe, stop_loss, take_profit, highest_price, lowest_price, last_advice, created_at, last_checked_at, last_notified_at, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                INSERT INTO tracked_trades (user_id, user_name, channel_id, symbol, direction, entry_price, timeframe, stop_loss, take_profit, highest_price, lowest_price, last_advice, created_at, last_checked_at, last_notified_at, is_active, leverage, margin_usd, liquidation_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -197,6 +234,9 @@ class PaperTradingManager:
                     now,
                     now,
                     now,
+                    leverage,
+                    margin_usd,
+                    liq_price,
                 ),
             )
             track_id = cursor.lastrowid
@@ -220,8 +260,12 @@ class PaperTradingManager:
                 last_checked_at=now,
                 last_notified_at=now,
                 is_active=1,
+                leverage=leverage,
+                margin_usd=margin_usd,
+                liquidation_price=liq_price,
             )
-            return True, f"AI Copilot is now actively watching **{symbol} {direction}** from entry `${entry_price:,.2f}` on `{timeframe}` timeframe!", trade
+            margin_str = f" (${margin_usd:,.2f} Margin)" if margin_usd > 0 else ""
+            return True, f"AI Copilot is now actively watching **{symbol} {direction}** ({leverage}x{margin_str}) from entry `${entry_price:,.2f}` on `{timeframe}` timeframe!", trade
 
     def get_active_tracked_trade(self, user_id: str) -> Optional[TrackedTrade]:
         with self._get_connection() as conn:
@@ -230,6 +274,7 @@ class PaperTradingManager:
             r = cursor.fetchone()
             if not r:
                 return None
+            keys = r.keys()
             return TrackedTrade(
                 id=r["id"],
                 user_id=r["user_id"],
@@ -246,8 +291,11 @@ class PaperTradingManager:
                 last_advice=r["last_advice"],
                 created_at=r["created_at"],
                 last_checked_at=r["last_checked_at"],
-                last_notified_at=r["last_notified_at"] if "last_notified_at" in r.keys() and r["last_notified_at"] else r["created_at"],
+                last_notified_at=r["last_notified_at"] if "last_notified_at" in keys and r["last_notified_at"] else r["created_at"],
                 is_active=r["is_active"],
+                leverage=r["leverage"] if "leverage" in keys and r["leverage"] else 1,
+                margin_usd=r["margin_usd"] if "margin_usd" in keys and r["margin_usd"] else 0.0,
+                liquidation_price=r["liquidation_price"] if "liquidation_price" in keys and r["liquidation_price"] else None,
             )
 
     def get_all_active_tracked_trades(self) -> List[TrackedTrade]:
@@ -257,6 +305,7 @@ class PaperTradingManager:
             rows = cursor.fetchall()
             trades = []
             for r in rows:
+                keys = r.keys()
                 trades.append(
                     TrackedTrade(
                         id=r["id"],
@@ -274,8 +323,11 @@ class PaperTradingManager:
                         last_advice=r["last_advice"],
                         created_at=r["created_at"],
                         last_checked_at=r["last_checked_at"],
-                        last_notified_at=r["last_notified_at"] if "last_notified_at" in r.keys() and r["last_notified_at"] else r["created_at"],
+                        last_notified_at=r["last_notified_at"] if "last_notified_at" in keys and r["last_notified_at"] else r["created_at"],
                         is_active=r["is_active"],
+                        leverage=r["leverage"] if "leverage" in keys and r["leverage"] else 1,
+                        margin_usd=r["margin_usd"] if "margin_usd" in keys and r["margin_usd"] else 0.0,
+                        liquidation_price=r["liquidation_price"] if "liquidation_price" in keys and r["liquidation_price"] else None,
                     )
                 )
             return trades

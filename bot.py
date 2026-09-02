@@ -347,8 +347,41 @@ def build_copilot_status_embed(trade: TrackedTrade, current_price: float, analys
         tp1_pct = ((trade.entry_price - ai_tp1) / trade.entry_price) * 100.0
         tp2_pct = ((trade.entry_price - ai_tp2) / trade.entry_price) * 100.0
 
+    # Leverage, Margin & ROE calculations
+    lev = trade.leverage if trade.leverage else 1
+    margin = trade.margin_usd if trade.margin_usd else 0.0
+    roe_pct = pnl_pct * lev
+    pnl_usd = (roe_pct / 100.0) * margin if margin > 0 else 0.0
+
+    # Liquidation Price calculation and proximity
+    liq_price = trade.liquidation_price
+    if (not liq_price or liq_price <= 0) and lev > 1:
+        from paper_trading import calculate_liquidation_price
+        liq_price = calculate_liquidation_price(trade.entry_price, trade.direction, lev)
+
+    dist_liq_pct = 999.0
+    if lev > 1 and liq_price and liq_price > 0:
+        if is_long:
+            dist_liq_pct = ((current_price - liq_price) / current_price) * 100.0
+            dist_str = f"{dist_liq_pct:.2f}% buffer below"
+        else:
+            dist_liq_pct = ((liq_price - current_price) / current_price) * 100.0
+            dist_str = f"{dist_liq_pct:.2f}% buffer above"
+
+        if dist_liq_pct <= 2.5:
+            liq_display = f"🚨 **CRITICAL:** **`${liq_price:,.2f}`** (`{dist_str}`) ☠️"
+        elif dist_liq_pct <= 5.0:
+            liq_display = f"⚠️ **CAUTION:** **`${liq_price:,.2f}`** (`{dist_str}`)"
+        else:
+            liq_display = f"🟢 **`${liq_price:,.2f}`** (`{dist_str}`)"
+    else:
+        liq_display = "`None (Spot / 1x No Liquidation)`"
+
     # AI Recommendation Assessment
-    if pnl_pct >= 1.2 and analysis and (("Overbought" in analysis.rsi_status and is_long) or ("Oversold" in analysis.rsi_status and not is_long)):
+    if lev > 1 and liq_price and liq_price > 0 and dist_liq_pct <= 2.5:
+        advice_title = "🚨 DANGER: APPROACHING LIQUIDATION"
+        advice_desc = f"Price (`${current_price:,.2f}`) is only **`{dist_liq_pct:.1f}%`** away from your Est. Liq Price (`${liq_price:,.2f}`). Exit immediately or cut loss to protect remaining capital!"
+    elif pnl_pct >= 1.2 and analysis and (("Overbought" in analysis.rsi_status and is_long) or ("Oversold" in analysis.rsi_status and not is_long)):
         advice_title = "⚡ FLASH CLOSE / LOCK IN GAINS"
         advice_desc = f"You are up **`+{pnl_pct:.2f}%`** and RSI is showing exhaustion. Consider taking profits or securing 70% of the position."
     elif pnl_pct >= 0.6:
@@ -361,15 +394,36 @@ def build_copilot_status_embed(trade: TrackedTrade, current_price: float, analys
         advice_title = "🧭 HOLD & STAY PATIENT"
         advice_desc = f"Price is tracking normally (`{pnl_pct:+.2f}%`). Maintain trade structure and let the setup play out."
 
+    lev_badge = f"({lev}x)" if lev > 1 else ""
     embed = discord.Embed(
-        title=f"🤖 AI TRADE COPILOT: {trade.symbol} {dir_emoji} {trade.direction}",
+        title=f"🤖 AI TRADE COPILOT: {trade.symbol} {dir_emoji} {trade.direction} {lev_badge}",
         color=pnl_color,
         description=f"**Real-Time Position Sentinel • Focused on `{trade.timeframe}` Timeframe**",
     )
 
     embed.add_field(name="📍 Your Entry Price", value=f"`${trade.entry_price:,.2f}`", inline=True)
     embed.add_field(name="💵 Live Current Price", value=f"`${current_price:,.2f}`", inline=True)
-    embed.add_field(name="📈 Unrealized Move", value=f"**`{pnl_pct:+.2f}%`**", inline=True)
+
+    # Unrealized Move + ROE + Dollar PnL
+    pnl_extra = ""
+    if margin > 0:
+        pnl_extra = f" (**`{roe_pct:+.2f}% ROE`** | **`${pnl_usd:+,.2f}`**)"
+    elif lev > 1:
+        pnl_extra = f" (**`{roe_pct:+.2f}% ROE`**)"
+    embed.add_field(name="📈 Unrealized PnL", value=f"**`{pnl_pct:+.2f}%`**{pnl_extra}", inline=True)
+
+    # Position Sizing & Liquidation Risk Block
+    if lev > 1 or margin > 0:
+        margin_info = f"`${margin:,.2f}` (Size: `${margin * lev:,.2f}`)" if margin > 0 else "`Not Specified`"
+        embed.add_field(
+            name="⚡ Futures Margin & Liquidation Risk",
+            value=(
+                f"• **Leverage:** `{lev}x`\n"
+                f"• **Margin Allocated:** {margin_info}\n"
+                f"• **☠️ Est. Liq Price:** {liq_display}"
+            ),
+            inline=False,
+        )
 
     # Dedicated AI Recommended SL field
     embed.add_field(
@@ -831,11 +885,13 @@ async def forecast_command(interaction: discord.Interaction, symbol: str):
 
 # ==================== AI ACTIVE TRADE COPILOT COMMANDS ====================
 
-@bot.tree.command(name="track", description="🤖 AI Trade Copilot: Track your active trade entry price & receive live advice.")
+@bot.tree.command(name="track", description="🤖 AI Trade Copilot: Track your active trade entry price, leverage, margin & Est. Liq.")
 @app_commands.describe(
     symbol="Asset symbol (e.g. GOLD, BTC/USDT, SOL/USDT)",
     direction="LONG or SHORT",
     entry_price="Your actual entry price",
+    leverage="Leverage multiplier (e.g. 5, 10, 20, 50) - Default: 1x",
+    margin="Margin allocated in USD (e.g. 100, 500, 1000)",
     timeframe="Timeframe to monitor (1m, 5m, 1h, 4h) - Default: 5m",
     stop_loss="Optional Stop Loss price",
     take_profit="Optional Take Profit price",
@@ -854,6 +910,8 @@ async def track_command(
     symbol: str,
     direction: app_commands.Choice[str],
     entry_price: float,
+    leverage: Optional[int] = 1,
+    margin: Optional[float] = 0.0,
     timeframe: Optional[app_commands.Choice[str]] = None,
     stop_loss: Optional[float] = None,
     take_profit: Optional[float] = None,
@@ -862,6 +920,8 @@ async def track_command(
     disp = format_display_symbol(symbol)
     tf = timeframe.value if timeframe else "5m"
     dir_val = direction.value
+    lev = leverage if leverage and leverage >= 1 else 1
+    m_usd = margin if margin and margin > 0 else 0.0
 
     success, msg, trade = paper_trader.start_trade_tracking(
         user_id=str(interaction.user.id),
@@ -873,6 +933,8 @@ async def track_command(
         timeframe=tf,
         stop_loss=stop_loss,
         take_profit=take_profit,
+        leverage=lev,
+        margin_usd=m_usd,
     )
 
     if not success:
@@ -1640,11 +1702,82 @@ async def prefix_forecast(ctx: commands.Context, symbol: str = "BTC/USDT"):
 
 
 @bot.command(name="entrypricein", aliases=["track", "follow"])
-async def prefix_entrypricein(ctx: commands.Context, symbol: str = "GOLD", direction: str = "LONG", entry_price: float = 0.0, timeframe: str = "5m", sl: Optional[float] = None, tp: Optional[float] = None):
-    """Usage: !entrypricein GOLD LONG 4405.20 5m 4390 4440"""
-    if entry_price <= 0:
-        await ctx.send("❌ Usage: `!entrypricein <symbol> <LONG/SHORT> <entry_price> [timeframe: 1m/5m/1h/4h] [SL] [TP]`\nExample: `!entrypricein GOLD LONG 4405.20 5m`")
+async def prefix_entrypricein(ctx: commands.Context, *args):
+    """
+    Usage:
+      !entrypricein <symbol> <LONG/SHORT> <entry_price> [leverage: 10x] [margin: 500] [timeframe: 5m] [SL] [TP]
+    Examples:
+      !entrypricein GOLD LONG 4405.20 10x 500 5m
+      !entrypricein BTC LONG 78500 20x $1000
+      !entrypricein SOL SHORT 145.50 5x
+      !entrypricein GOLD LONG 4405.20 5m
+    """
+    if len(args) < 3:
+        await ctx.send(
+            "❌ **Usage:** `!entrypricein <symbol> <LONG/SHORT> <entry_price> [leverage: 10x] [margin: 500] [timeframe: 5m] [SL] [TP]`\n"
+            "• **Examples:**\n"
+            "  `!entrypricein GOLD LONG 4405.20 10x 500 5m`\n"
+            "  `!entrypricein BTC LONG 78500 20x 1000`\n"
+            "  `!entrypricein SOL SHORT 145.50 5x`"
+        )
         return
+
+    symbol = args[0]
+    direction = args[1].upper()
+    try:
+        entry_price = float(str(args[2]).replace("$", "").replace(",", ""))
+    except ValueError:
+        await ctx.send(f"❌ Invalid entry price: `{args[2]}`.")
+        return
+
+    if direction not in ("LONG", "SHORT"):
+        await ctx.send("❌ Direction must be **LONG** or **SHORT**.")
+        return
+
+    # Dynamic parsing for remaining arguments
+    leverage = 1
+    margin_usd = 0.0
+    timeframe = "5m"
+    sl = None
+    tp = None
+
+    valid_tfs = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+    remaining_floats = []
+
+    for a in args[3:]:
+        clean = str(a).strip().lower()
+        if clean.endswith("x") and clean[:-1].isdigit():
+            leverage = int(clean[:-1])
+        elif clean in valid_tfs:
+            timeframe = clean
+        elif clean.startswith("$"):
+            try:
+                margin_usd = float(clean[1:].replace(",", ""))
+            except ValueError:
+                pass
+        else:
+            try:
+                num = float(clean.replace(",", ""))
+                remaining_floats.append(num)
+            except ValueError:
+                pass
+
+    # Interpret unflagged numbers:
+    if remaining_floats:
+        first_num = remaining_floats[0]
+        # Check if first number is leverage without 'x'
+        if leverage == 1 and first_num in [1, 2, 3, 5, 10, 20, 25, 50, 75, 100, 125] and len(remaining_floats) >= 2:
+            leverage = int(first_num)
+            margin_usd = remaining_floats[1]
+            remaining_floats = remaining_floats[2:]
+        elif margin_usd == 0.0 and (first_num >= 10.0 or "." in str(first_num)):
+            margin_usd = first_num
+            remaining_floats = remaining_floats[1:]
+
+    if len(remaining_floats) >= 1 and sl is None:
+        sl = remaining_floats[0]
+    if len(remaining_floats) >= 2 and tp is None:
+        tp = remaining_floats[1]
 
     disp = format_display_symbol(symbol)
     success, msg, trade = paper_trader.start_trade_tracking(
@@ -1652,11 +1785,13 @@ async def prefix_entrypricein(ctx: commands.Context, symbol: str = "GOLD", direc
         user_name=ctx.author.display_name,
         channel_id=ctx.channel.id,
         symbol=disp,
-        direction=direction.upper(),
+        direction=direction,
         entry_price=entry_price,
         timeframe=timeframe,
         stop_loss=sl,
         take_profit=tp,
+        leverage=leverage,
+        margin_usd=margin_usd,
     )
 
     if not success:
