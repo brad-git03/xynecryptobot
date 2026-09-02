@@ -300,10 +300,57 @@ def build_copilot_status_embed(trade: TrackedTrade, current_price: float, analys
     pnl_color = config.COLOR_STRONG_BUY if pnl_pct >= 0 else config.COLOR_STRONG_SELL
     dir_emoji = "🟢" if is_long else "🔴"
 
+    # ATR / Volatility buffer calculation
+    atr_val = (analysis.volatility_atr_pct / 100.0 * trade.entry_price) if (analysis and analysis.volatility_atr_pct > 0) else (trade.entry_price * 0.012)
+
+    # 1. AI Recommended Dynamic Stop Loss (SL) Calculation
+    if is_long:
+        initial_ai_sl = max(analysis.support_1 if analysis else (trade.entry_price - 1.5 * atr_val), trade.entry_price - (1.6 * atr_val))
+        if initial_ai_sl >= trade.entry_price:
+            initial_ai_sl = trade.entry_price * 0.985
+
+        if pnl_pct >= 0.6:
+            ai_sl = trade.entry_price  # Move to Break-Even!
+            sl_pct_diff = 0.0
+            sl_badge = "🛡️ **MOVE TO BREAK-EVEN (0.00% Risk-Free!)**"
+            sl_desc = f"• **Recommended SL:** **`${trade.entry_price:,.2f}`** (`0.00%` - Risk-Free Break-Even)\n• _Lock in your entry so this trade can never result in a loss!_"
+        else:
+            ai_sl = initial_ai_sl
+            sl_pct_diff = ((ai_sl - trade.entry_price) / trade.entry_price) * 100.0
+            sl_badge = f"`${ai_sl:,.2f}` (**`{sl_pct_diff:.2f}%`**)"
+            sl_desc = f"• **Recommended SL:** **`${ai_sl:,.2f}`** (**`{sl_pct_diff:.2f}%`** from entry)\n• _Invalidation: Close trade if candle closes below this floor to prevent large drawdown._"
+
+        # AI Recommended Dynamic Take Profit (TP) Targets
+        ai_tp1 = trade.entry_price + (1.6 * atr_val)
+        ai_tp2 = trade.entry_price + (3.0 * atr_val)
+        tp1_pct = ((ai_tp1 - trade.entry_price) / trade.entry_price) * 100.0
+        tp2_pct = ((ai_tp2 - trade.entry_price) / trade.entry_price) * 100.0
+    else:  # SHORT
+        initial_ai_sl = min(analysis.resistance_1 if analysis else (trade.entry_price + 1.5 * atr_val), trade.entry_price + (1.6 * atr_val))
+        if initial_ai_sl <= trade.entry_price:
+            initial_ai_sl = trade.entry_price * 1.015
+
+        if pnl_pct >= 0.6:
+            ai_sl = trade.entry_price  # Move to Break-Even!
+            sl_pct_diff = 0.0
+            sl_badge = "🛡️ **MOVE TO BREAK-EVEN (0.00% Risk-Free!)**"
+            sl_desc = f"• **Recommended SL:** **`${trade.entry_price:,.2f}`** (`0.00%` - Risk-Free Break-Even)\n• _Lock in your entry so this trade can never result in a loss!_"
+        else:
+            ai_sl = initial_ai_sl
+            sl_pct_diff = -(((ai_sl - trade.entry_price) / trade.entry_price) * 100.0)
+            sl_badge = f"`${ai_sl:,.2f}` (**`{sl_pct_diff:.2f}%`**)"
+            sl_desc = f"• **Recommended SL:** **`${ai_sl:,.2f}`** (**`{sl_pct_diff:.2f}%`** from entry)\n• _Invalidation: Close trade if candle closes above this ceiling to prevent large drawdown._"
+
+        # AI Recommended Dynamic Take Profit (TP) Targets
+        ai_tp1 = trade.entry_price - (1.6 * atr_val)
+        ai_tp2 = trade.entry_price - (3.0 * atr_val)
+        tp1_pct = ((trade.entry_price - ai_tp1) / trade.entry_price) * 100.0
+        tp2_pct = ((trade.entry_price - ai_tp2) / trade.entry_price) * 100.0
+
     # AI Recommendation Assessment
     if pnl_pct >= 1.2 and analysis and (("Overbought" in analysis.rsi_status and is_long) or ("Oversold" in analysis.rsi_status and not is_long)):
         advice_title = "⚡ FLASH CLOSE / LOCK IN GAINS"
-        advice_desc = f"You are up **`+{pnl_pct:.2f}%`** and RSI is showing exhaustion. Consider closing position or taking 70% off the table."
+        advice_desc = f"You are up **`+{pnl_pct:.2f}%`** and RSI is showing exhaustion. Consider taking profits or securing 70% of the position."
     elif pnl_pct >= 0.6:
         advice_title = "🛡️ MOVE STOP LOSS TO BREAK-EVEN"
         advice_desc = f"You are up **`+{pnl_pct:.2f}%`**. Move your Stop Loss to your Entry Price (`${trade.entry_price:,.2f}`) for a **guaranteed risk-free trade**!"
@@ -324,19 +371,39 @@ def build_copilot_status_embed(trade: TrackedTrade, current_price: float, analys
     embed.add_field(name="💵 Live Current Price", value=f"`${current_price:,.2f}`", inline=True)
     embed.add_field(name="📈 Unrealized Move", value=f"**`{pnl_pct:+.2f}%`**", inline=True)
 
+    # Dedicated AI Recommended SL field
+    embed.add_field(
+        name="🛑 AI Recommended Stop Loss (Risk Prevention)",
+        value=sl_desc,
+        inline=False,
+    )
+
+    # Dedicated AI Recommended TP field
+    tp_desc = (
+        f"• **🎯 Target 1 (TP1):** **`${ai_tp1:,.2f}`** (**`+{tp1_pct:.2f}%`** gain)\n"
+        f"• **🚀 Target 2 (TP2):** **`${ai_tp2:,.2f}`** (**`+{tp2_pct:.2f}%`** gain)"
+    )
+    embed.add_field(
+        name="🎯 AI Recommended Take Profit (Profit Maximization)",
+        value=tp_desc,
+        inline=False,
+    )
+
     if analysis:
         rsi_str = f"`{analysis.rsi_value:.1f}` ({analysis.rsi_status})"
         macd_str = f"`{analysis.macd_status}`"
         trend_str = f"`{analysis.ma_trend_status}`"
         embed.add_field(name="📊 Live Momentum Health", value=f"• **RSI**: {rsi_str}\n• **MACD**: {macd_str}\n• **Trend**: {trend_str}", inline=False)
 
-    embed.add_field(name=f"💡 AI Recommendation: {advice_title}", value=advice_desc, inline=False)
+    embed.add_field(name=f"💡 AI Advice: {advice_title}", value=advice_desc, inline=False)
 
-    tp_text = f"`${trade.take_profit:,.2f}`" if trade.take_profit else "`None`"
-    sl_text = f"`${trade.stop_loss:,.2f}`" if trade.stop_loss else "`None`"
-    embed.add_field(name="🎯 Targets", value=f"• **TP**: {tp_text} | • **SL**: {sl_text}", inline=False)
+    # User's personal configured targets (if any)
+    if trade.take_profit or trade.stop_loss:
+        user_tp = f"`${trade.take_profit:,.2f}`" if trade.take_profit else "`None`"
+        user_sl = f"`${trade.stop_loss:,.2f}`" if trade.stop_loss else "`None`"
+        embed.add_field(name="⚙️ Your Configured Manual Targets", value=f"• **TP**: {user_tp} | • **SL**: {user_sl}", inline=False)
 
-    embed.set_footer(text="AI Sentinel updates you on momentum shifts • Use !stoptrack when you exit")
+    embed.set_footer(text="AI Sentinel dynamically updates SL & TP • Use !stoptrack when you exit")
     return embed
 
 
@@ -2106,8 +2173,25 @@ async def active_trade_copilot_loop():
                 if ch:
                     embed = build_copilot_status_embed(trade, curr_p, analysis)
                     view = CopilotActionView(trade.user_id)
+                    # Quick SL/TP preview calculation for notification
+                    atr_h = (analysis.volatility_atr_pct / 100.0 * trade.entry_price) if (analysis and analysis.volatility_atr_pct > 0) else (trade.entry_price * 0.012)
+                    if is_long:
+                        quick_sl = trade.entry_price if pnl_pct >= 0.6 else max(trade.entry_price - 1.5 * atr_h, trade.entry_price * 0.985)
+                        quick_tp = trade.entry_price + (1.6 * atr_h)
+                        sl_diff = 0.0 if pnl_pct >= 0.6 else ((quick_sl - trade.entry_price) / trade.entry_price * 100.0)
+                        tp_diff = ((quick_tp - trade.entry_price) / trade.entry_price * 100.0)
+                    else:
+                        quick_sl = trade.entry_price if pnl_pct >= 0.6 else min(trade.entry_price + 1.5 * atr_h, trade.entry_price * 1.015)
+                        quick_tp = trade.entry_price - (1.6 * atr_h)
+                        sl_diff = 0.0 if pnl_pct >= 0.6 else -((quick_sl - trade.entry_price) / trade.entry_price * 100.0)
+                        tp_diff = ((trade.entry_price - quick_tp) / trade.entry_price * 100.0)
+
+                    sl_label = "Break-Even (0.00%)" if pnl_pct >= 0.6 else f"${quick_sl:,.2f} ({sl_diff:.2f}%)"
                     pnl_sign = "+" if pnl_pct >= 0 else ""
-                    msg_header = f"🚨 <@{trade.user_id}> **AI Copilot Alert:** `{trade.symbol}` **{trade.direction}** is currently **`{pnl_sign}{pnl_pct:.2f}%`** (`${price_delta:+,.2f}`) • _{advice_key}_"
+                    msg_header = (
+                        f"🚨 <@{trade.user_id}> **AI Copilot Alert:** `{trade.symbol}` **{trade.direction}** is **`{pnl_sign}{pnl_pct:.2f}%`** (`${price_delta:+,.2f}`)\n"
+                        f"• 🛑 **AI Rec. SL**: `{sl_label}` | 🎯 **AI Rec. TP**: `${quick_tp:,.2f} (+{tp_diff:.2f}%)`"
+                    )
                     await ch.send(content=msg_header, embed=embed, view=view)
                     logger.info(f"Sent Copilot Notification for {trade.symbol} to user {trade.user_id} ({advice_key})")
             else:
