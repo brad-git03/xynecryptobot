@@ -298,6 +298,29 @@ def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
     is_long = "LONG" in setup.direction
     color = config.COLOR_STRONG_BUY if is_long else config.COLOR_STRONG_SELL
 
+    # Determine real-time entry readiness
+    is_inside_zone = setup.safe_entry_low <= setup.current_price <= setup.safe_entry_high
+    if is_long:
+        if is_inside_zone or abs(setup.current_price - setup.safe_entry_high) / setup.current_price < 0.0015:
+            entry_status_badge = "🟢 **ENTRY VERDICT: ✅ GOOD TO ENTER NOW (In Prime Buy Zone!)**"
+            entry_action_sub = "Price is currently resting directly on the institutional demand floor. Optimal risk-to-reward to open LONG!"
+        elif setup.current_price > setup.safe_entry_high:
+            entry_status_badge = "⏳ **ENTRY VERDICT: ⏳ WAIT FOR LIMIT FILL (Do NOT Market Buy)**"
+            entry_action_sub = f"Price is `{setup.distance_to_entry_pct:.2f}%` above the safe zone. Place a **Limit Buy Order** inside `{setup.safe_entry_zone}` and wait for the pullback!"
+        else:
+            entry_status_badge = "⚠️ **ENTRY VERDICT: ⚠️ BELOW SAFE FLOOR (Wait for Bounce Wick)**"
+            entry_action_sub = "Price wicked below the standard floor. Await a 5m green candle close before entering."
+    else:  # SHORT
+        if is_inside_zone or abs(setup.current_price - setup.safe_entry_low) / setup.current_price < 0.0015:
+            entry_status_badge = "🔴 **ENTRY VERDICT: ✅ GOOD TO SHORT NOW (Retesting Supply Ceiling!)**"
+            entry_action_sub = "Price is currently testing the institutional resistance ceiling. High-conviction SHORT entry!"
+        elif setup.current_price < setup.safe_entry_low:
+            entry_status_badge = "⏳ **ENTRY VERDICT: ⏳ WAIT FOR RETEST (Do NOT Chase Short)**"
+            entry_action_sub = f"Price already dropped `{setup.distance_to_entry_pct:.2f}%` below ceiling. Place a **Limit Sell Order** inside `{setup.safe_entry_zone}` and wait for relief bounce!"
+        else:
+            entry_status_badge = "⚠️ **ENTRY VERDICT: ⚠️ ABOVE CEILING (Wait for Bearish Wick)**"
+            entry_action_sub = "Price wicked above resistance. Await a 5m bearish rejection wick before entering."
+
     embed = discord.Embed(
         title=f"🛡️ SNIPER SAFE ENTRY & LEVERAGE ADVISOR: {setup.symbol}",
         color=color,
@@ -305,6 +328,13 @@ def build_safe_entry_embed(setup: SafeEntrySetup) -> discord.Embed:
             f"**Current Price:** `${setup.current_price:,.2f}` • **Confidence:** `{setup.confidence}%`\n"
             f"**Strategy Bias:** **`{setup.direction}`**"
         ),
+    )
+
+    # 0. High-Visibility Entry Readiness Traffic Light
+    embed.add_field(
+        name="🚦 Real-Time Entry Readiness Status",
+        value=f"{entry_status_badge}\n• _{entry_action_sub}_",
+        inline=False,
     )
 
     # 1. Sniper Safe Entry Zone
