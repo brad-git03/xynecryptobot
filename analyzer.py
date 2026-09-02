@@ -43,6 +43,33 @@ class SwingSetup:
 
 
 @dataclass
+class HorizonStatus:
+    horizon_title: str       # "⚡ Next Minutes / Hours (5m)", "📈 Next Days (4h)", "🌊 Next Weeks / Months (1D)"
+    trend_status: str        # "BULLISH UPTREND 🟢", "BEARISH DOWNTREND 🔴", "SIDEWAYS CONSOLIDATION ⏳"
+    rationale: str           # e.g. "Trading above 50 & 200 EMA with positive MACD expansion"
+    rsi_val: float
+    projected_target: float
+    target_gain_pct: float
+    invalidation_level: float
+    confidence_pct: int
+
+
+@dataclass
+class MultiHorizonForecast:
+    symbol: str
+    current_price: float
+    short_term: HorizonStatus   # Next Minutes / Hours
+    mid_term: HorizonStatus     # Next Days
+    long_term: HorizonStatus    # Next Weeks / Months
+    overall_bias: str           # "STRONG BULLISH ALIGNMENT 🚀", "BEARISH REJECTION 🔻", etc.
+    entry_verdict: str          # "✅ PRIME ENTRY POINT NOW", "🎯 BUY THE DIP (WAIT FOR PULLBACK)", "🛑 DO NOT ENTER (HIGH CHOP / DOWNTREND)"
+    entry_zone: str             # e.g. "$78,400 - $78,800"
+    detailed_action_plan: str   # Clear institutional recommendation on whether to enter and how to execute
+    macro_invalidation: float   # Price level where macro trend fails
+    overall_confidence: int
+
+
+@dataclass
 class ScalpRecommendation:
     action: str  # "SCALP LONG", "SCALP SHORT", "WAIT / NO TRADE"
     confidence: int  # 0-100%
@@ -285,6 +312,230 @@ class CryptoAnalyzer:
             trend_regime=regime,
             catalyst_reason=reason,
             estimated_hold_duration=hold_duration,
+        )
+
+    @classmethod
+    def generate_multi_horizon_forecast(
+        cls,
+        df_5m: Optional[pd.DataFrame],
+        df_4h: Optional[pd.DataFrame],
+        df_1d: Optional[pd.DataFrame],
+        symbol: str,
+    ) -> Optional[MultiHorizonForecast]:
+        """
+        Generates comprehensive multi-horizon trend status and forecast:
+        1. Minutes / Hours (5m)
+        2. Days (4h)
+        3. Weeks / Months (1D)
+        Provides actionable entry verdict, limit zones, and price targets.
+        """
+        if df_5m is None or len(df_5m) < 30:
+            return None
+
+        closes_5m = df_5m["close"]
+        curr_p = float(closes_5m.iloc[-1])
+        atr_5m = float(cls.calculate_atr(df_5m, 14).iloc[-1])
+
+        # 1. SHORT-TERM (Minutes / Hours - 5m)
+        e9_5m = cls.calculate_ema(closes_5m, 9).iloc[-1]
+        e21_5m = cls.calculate_ema(closes_5m, 21).iloc[-1]
+        rsi_5m = float(cls.calculate_rsi(closes_5m, 14).iloc[-1])
+        _, _, hist_5m = cls.calculate_macd(closes_5m, 12, 26, 9)
+        h5m = float(hist_5m.iloc[-1])
+
+        if e9_5m > e21_5m and rsi_5m >= 48:
+            st_trend = "BULLISH UPTREND 🟢"
+            st_target = curr_p + (1.6 * atr_5m)
+            st_sl = curr_p - (1.2 * atr_5m)
+            st_conf = min(95, int(65 + (rsi_5m - 50) * 1.2 + (10 if h5m > 0 else 0)))
+            st_desc = f"EMA 9 > 21 with upward momentum (RSI: {rsi_5m:.1f}, MACD Hist: +{h5m:.4f})"
+        elif e9_5m < e21_5m and rsi_5m <= 52:
+            st_trend = "BEARISH DOWNTREND 🔴"
+            st_target = curr_p - (1.6 * atr_5m)
+            st_sl = curr_p + (1.2 * atr_5m)
+            st_conf = min(95, int(65 + (50 - rsi_5m) * 1.2 + (10 if h5m < 0 else 0)))
+            st_desc = f"EMA 9 < 21 with seller pressure (RSI: {rsi_5m:.1f}, MACD Hist: {h5m:.4f})"
+        else:
+            st_trend = "SIDEWAYS CONSOLIDATION ⏳"
+            st_target = curr_p + (1.0 * atr_5m)
+            st_sl = curr_p - (1.0 * atr_5m)
+            st_conf = 55
+            st_desc = f"Tight consolidation around EMAs (RSI: {rsi_5m:.1f})"
+
+        st_gain = ((st_target - curr_p) / curr_p) * 100.0
+        short_status = HorizonStatus(
+            horizon_title="⚡ Next Minutes / Hours (5m)",
+            trend_status=st_trend,
+            rationale=st_desc,
+            rsi_val=round(rsi_5m, 1),
+            projected_target=round(st_target, 4),
+            target_gain_pct=round(st_gain, 2),
+            invalidation_level=round(st_sl, 4),
+            confidence_pct=st_conf,
+        )
+
+        # 2. MID-TERM (Next Days - 4h)
+        if df_4h is not None and len(df_4h) >= 30:
+            closes_4h = df_4h["close"]
+            atr_4h = float(cls.calculate_atr(df_4h, 14).iloc[-1])
+            e20_4h = cls.calculate_ema(closes_4h, 20).iloc[-1]
+            e50_4h = cls.calculate_ema(closes_4h, 50).iloc[-1]
+            e200_4h = cls.calculate_ema(closes_4h, 200).iloc[-1] if len(df_4h) >= 200 else cls.calculate_ema(closes_4h, len(df_4h)).iloc[-1]
+            rsi_4h = float(cls.calculate_rsi(closes_4h, 14).iloc[-1])
+
+            if curr_p > e50_4h and rsi_4h >= 46:
+                mt_trend = "BULLISH EXPANSION 🟢 (Hold 2 - 5 Days)"
+                mt_target = curr_p + (2.5 * atr_4h)
+                mt_sl = min(e50_4h, curr_p - (1.8 * atr_4h))
+                mt_conf = min(96, int(70 + (rsi_4h - 50) + (10 if curr_p > e200_4h else 0)))
+                mt_desc = f"Holding above 4H EMA 50 (${e50_4h:,.2f}), RSI {rsi_4h:.1f} bullish trend structure"
+            elif curr_p < e50_4h and rsi_4h <= 54:
+                mt_trend = "BEARISH BREAKDOWN 🔴 (Hold 2 - 5 Days)"
+                mt_target = curr_p - (2.5 * atr_4h)
+                mt_sl = max(e50_4h, curr_p + (1.8 * atr_4h))
+                mt_conf = min(96, int(70 + (50 - rsi_4h) + (10 if curr_p < e200_4h else 0)))
+                mt_desc = f"Rejecting below 4H EMA 50 (${e50_4h:,.2f}), RSI {rsi_4h:.1f} downward push"
+            else:
+                mt_trend = "SIDEWAYS SWING CHOP ⏳"
+                mt_target = curr_p + (1.5 * atr_4h)
+                mt_sl = curr_p - (1.5 * atr_4h)
+                mt_conf = 55
+                mt_desc = f"Coiling inside 4H EMA range (${e50_4h:,.2f} - ${e20_4h:,.2f})"
+        else:
+            mt_trend = st_trend
+            mt_target = curr_p * (1.04 if "BULLISH" in st_trend else 0.96)
+            mt_sl = curr_p * (0.97 if "BULLISH" in st_trend else 1.03)
+            rsi_4h = rsi_5m
+            mt_conf = 60
+            mt_desc = "Extrapolated from short-term momentum data"
+
+        mt_gain = ((mt_target - curr_p) / curr_p) * 100.0
+        mid_status = HorizonStatus(
+            horizon_title="📈 Next Days (4h Swing)",
+            trend_status=mt_trend,
+            rationale=mt_desc,
+            rsi_val=round(rsi_4h, 1),
+            projected_target=round(mt_target, 4),
+            target_gain_pct=round(mt_gain, 2),
+            invalidation_level=round(mt_sl, 4),
+            confidence_pct=mt_conf,
+        )
+
+        # 3. LONG-TERM (Next Weeks / Months - 1D)
+        if df_1d is not None and len(df_1d) >= 30:
+            closes_1d = df_1d["close"]
+            e50_1d = cls.calculate_ema(closes_1d, 50).iloc[-1]
+            e200_1d = cls.calculate_ema(closes_1d, 200).iloc[-1] if len(df_1d) >= 200 else cls.calculate_ema(closes_1d, len(df_1d)).iloc[-1]
+            rsi_1d = float(cls.calculate_rsi(closes_1d, 14).iloc[-1])
+
+            is_macro_bull = curr_p > e200_1d and e50_1d >= e200_1d * 0.97
+            is_macro_bear = curr_p < e200_1d and e50_1d <= e200_1d * 1.03
+
+            if is_macro_bull and rsi_1d >= 45:
+                lt_trend = "MACRO BULL CYCLE 🟢 (Weeks / Months)"
+                lt_target = curr_p * 1.25  # +25% macro target
+                lt_sl = e200_1d
+                lt_conf = min(98, int(75 + (rsi_1d - 50) * 0.8))
+                lt_desc = f"Institutional accumulation above 200-Day EMA (${e200_1d:,.2f}), Daily RSI {rsi_1d:.1f}"
+            elif is_macro_bear and rsi_1d <= 55:
+                lt_trend = "MACRO BEAR REGIME 🔴 (Weeks / Months)"
+                lt_target = curr_p * 0.80  # -20% macro target
+                lt_sl = e200_1d
+                lt_conf = min(98, int(75 + (50 - rsi_1d) * 0.8))
+                lt_desc = f"Distribution below 200-Day EMA (${e200_1d:,.2f}), Daily RSI {rsi_1d:.1f}"
+            else:
+                lt_trend = "MACRO CONSOLIDATION / ACCUMULATION ⏳"
+                lt_target = curr_p * 1.10
+                lt_sl = curr_p * 0.90
+                lt_conf = 60
+                lt_desc = f"Testing Daily 50/200 EMA transition zone (${e50_1d:,.2f} / ${e200_1d:,.2f})"
+        else:
+            lt_trend = mt_trend
+            lt_target = curr_p * (1.15 if "BULLISH" in mt_trend else 0.85)
+            lt_sl = curr_p * (0.92 if "BULLISH" in mt_trend else 1.08)
+            rsi_1d = rsi_4h
+            lt_conf = 65
+            lt_desc = "Extrapolated from multi-day swing trend"
+
+        lt_gain = ((lt_target - curr_p) / curr_p) * 100.0
+        long_status = HorizonStatus(
+            horizon_title="🌊 Next Weeks / Months (1D Macro)",
+            trend_status=lt_trend,
+            rationale=lt_desc,
+            rsi_val=round(rsi_1d, 1),
+            projected_target=round(lt_target, 4),
+            target_gain_pct=round(lt_gain, 2),
+            invalidation_level=round(lt_sl, 4),
+            confidence_pct=lt_conf,
+        )
+
+        # 4. OVERALL ALIGNMENT & ENTRY VERDICT
+        bull_count = sum(1 for t in [st_trend, mt_trend, lt_trend] if "BULLISH" in t or "BULL" in t)
+        bear_count = sum(1 for t in [st_trend, mt_trend, lt_trend] if "BEARISH" in t or "BEAR" in t)
+
+        entry_low = curr_p - (0.4 * atr_5m)
+        entry_high = curr_p + (0.2 * atr_5m)
+        entry_zone = f"${entry_low:,.2f} - ${entry_high:,.2f}"
+
+        if bull_count == 3:
+            overall_bias = "STRONG BULLISH ALIGNMENT 🚀"
+            entry_verdict = "✅ PRIME BUY / LONG ENTRY NOW (100% Horizon Alignment)"
+            detailed_plan = (
+                f"**Recommendation:** **HIGH CONVICTION BUY**. All timeframes (Minutes, Days, Months) are pointing UP in sync.\n"
+                f"• **How to execute:** Enter a Limit Buy in `{entry_zone}`.\n"
+                f"• **Hold expectation:** Hold for {mid_status.projected_target:,.2f} ({mt_gain:+.2f}%) over the next 2-5 days."
+            )
+            macro_sl = mid_status.invalidation_level
+            overall_conf = int((st_conf + mt_conf + lt_conf) / 3) + 5
+        elif bull_count >= 2 and "BEARISH" in st_trend:
+            overall_bias = "BULLISH CONTINUATION (DIP OPPORTUNITY) 🎯"
+            entry_verdict = "🎯 BUY THE DIP (PRIME PULLBACK ZONE)"
+            detailed_plan = (
+                f"**Recommendation:** **EXCELLENT DISCOUNT BUY**. Macro (Weeks/Months) and Days are strongly BULLISH, while the short-term (Minutes) is giving a healthy pullback.\n"
+                f"• **How to execute:** Place limit orders between `${entry_low:,.2f}` and `${mid_status.invalidation_level:,.2f}`.\n"
+                f"• **Target:** `${mid_status.projected_target:,.2f}` (+{mt_gain:.2f}%)."
+            )
+            macro_sl = mid_status.invalidation_level
+            overall_conf = int((mt_conf + lt_conf) / 2)
+        elif bear_count == 3:
+            overall_bias = "STRONG BEARISH BREAKDOWN 🔻"
+            entry_verdict = "🛑 DO NOT BUY / PRIME SHORT ENTRY (Sell The Rip)"
+            detailed_plan = (
+                f"**Recommendation:** **HIGH RISK / AVOID BUYS**. All timeframes are in a macro downtrend.\n"
+                f"• **How to execute:** Look for SHORTs on relief bounces towards `{entry_zone}` or remain in cash/USDT.\n"
+                f"• **Downside Target:** `${mid_status.projected_target:,.2f}` ({mt_gain:+.2f}%)."
+            )
+            macro_sl = mid_status.invalidation_level
+            overall_conf = int((st_conf + mt_conf + lt_conf) / 3) + 5
+        elif bear_count >= 2:
+            overall_bias = "BEARISH DOWNWARD DRIFT 🔴"
+            entry_verdict = "⚠️ DEFENSIVE / WAIT (BEARISH BIAS)"
+            detailed_plan = (
+                f"**Recommendation:** Market is facing major resistance. Avoid buying until price reclaims ${mid_status.invalidation_level:,.2f}."
+            )
+            macro_sl = mid_status.invalidation_level
+            overall_conf = int((mt_conf + lt_conf) / 2)
+        else:
+            overall_bias = "MIXED / RANGE-BOUND ACCUMULATION ⏳"
+            entry_verdict = "⏳ PATIENT WAIT / RANGE TRADING ONLY"
+            detailed_plan = (
+                f"**Recommendation:** Timeframes are currently in conflict. Wait for a breakout above ${entry_high:,.2f} before entering new swings."
+            )
+            macro_sl = curr_p * 0.95
+            overall_conf = 60
+
+        return MultiHorizonForecast(
+            symbol=symbol,
+            current_price=round(curr_p, 4),
+            short_term=short_status,
+            mid_term=mid_status,
+            long_term=long_status,
+            overall_bias=overall_bias,
+            entry_verdict=entry_verdict,
+            entry_zone=entry_zone,
+            detailed_action_plan=detailed_plan,
+            macro_invalidation=round(macro_sl, 4),
+            overall_confidence=min(97, overall_conf),
         )
 
     @classmethod

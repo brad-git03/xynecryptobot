@@ -12,7 +12,7 @@ from discord.ext import commands, tasks
 
 import config
 from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, resolve_symbols
-from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup
+from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus
 from chart_generator import ChartGenerator
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade
 
@@ -227,6 +227,70 @@ def build_orderflow_embed(symbol: str, depth: Optional[Dict[str, Any]], flow: Op
         )
 
     embed.set_footer(text="Data sourced live from MEXC L2 Order Book & Trades • Sourced in real-time")
+    return embed
+
+
+def build_forecast_embed(forecast: MultiHorizonForecast) -> discord.Embed:
+    bias = forecast.overall_bias
+    color = config.COLOR_STRONG_BUY if "BULL" in bias else (config.COLOR_STRONG_SELL if "BEAR" in bias else config.COLOR_NEUTRAL)
+
+    embed = discord.Embed(
+        title=f"🔮 MULTI-HORIZON TREND OUTLOOK: {forecast.symbol}",
+        color=color,
+        description=(
+            f"**Current Price:** `${forecast.current_price:,.2f}`\n"
+            f"**Overall Market Bias:** **`{forecast.overall_bias}`** (`{forecast.overall_confidence}%` Confidence)"
+        ),
+    )
+
+    # 1. Short-Term (Minutes)
+    st = forecast.short_term
+    embed.add_field(
+        name=f"{st.horizon_title} ➔ {st.trend_status}",
+        value=(
+            f"• **Trend Rationale:** _{st.rationale}_\n"
+            f"• 🎯 **Projected Target:** **`${st.projected_target:,.2f}`** (`{st.target_gain_pct:+.2f}%`)\n"
+            f"• 🛑 **Invalidation (SL):** `${st.invalidation_level:,.2f}`"
+        ),
+        inline=False,
+    )
+
+    # 2. Mid-Term (Days)
+    mt = forecast.mid_term
+    embed.add_field(
+        name=f"{mt.horizon_title} ➔ {mt.trend_status}",
+        value=(
+            f"• **Trend Rationale:** _{mt.rationale}_\n"
+            f"• 🎯 **Projected Target:** **`${mt.projected_target:,.2f}`** (`{mt.target_gain_pct:+.2f}%`)\n"
+            f"• 🛑 **Invalidation (SL):** `${mt.invalidation_level:,.2f}`"
+        ),
+        inline=False,
+    )
+
+    # 3. Long-Term (Weeks/Months)
+    lt = forecast.long_term
+    embed.add_field(
+        name=f"{lt.horizon_title} ➔ {lt.trend_status}",
+        value=(
+            f"• **Trend Rationale:** _{lt.rationale}_\n"
+            f"• 🎯 **Macro Cycle Target:** **`${lt.projected_target:,.2f}`** (`{lt.target_gain_pct:+.2f}%`)\n"
+            f"• 🛑 **Macro Floor (200 EMA):** `${lt.invalidation_level:,.2f}`"
+        ),
+        inline=False,
+    )
+
+    # 4. Actionable Verdict
+    embed.add_field(
+        name="💡 AI Entry Recommendation & Verdict",
+        value=(
+            f"### **{forecast.entry_verdict}**\n"
+            f"• **Optimal Entry Zone:** `{forecast.entry_zone}`\n"
+            f"{forecast.detailed_action_plan}"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(text="Multi-horizon alignment ensures you only enter when higher timeframes support the trade")
     return embed
 
 
@@ -668,6 +732,33 @@ async def orderflow_command(interaction: discord.Interaction, symbol: str):
         await interaction.followup.send(embed=embed)
     except Exception as e:
         logger.error(f"Error in /orderflow: {e}")
+        await interaction.followup.send(f"❌ Error: `{str(e)}`", ephemeral=True)
+
+
+@bot.tree.command(name="forecast", description="🔮 Multi-Horizon Trend Outlook: Predicts trend & targets for Minutes, Days, Weeks, & Months.")
+@app_commands.describe(symbol="Trading pair symbol (e.g. BTC/USDT, GOLD, ETH/USDT, SOL/USDT)")
+async def forecast_command(interaction: discord.Interaction, symbol: str):
+    await interaction.response.defer(thinking=True)
+    disp = format_display_symbol(symbol)
+    try:
+        df_5m = await mexc_client.get_klines(symbol, interval="5m", limit=80)
+        df_4h = await mexc_client.get_klines(symbol, interval="4h", limit=80)
+        df_1d = await mexc_client.get_klines(symbol, interval="1d", limit=80)
+
+        if df_5m is None or len(df_5m) < 30:
+            await interaction.followup.send(f"❌ Could not fetch market data for `{disp}` from MEXC.", ephemeral=True)
+            return
+
+        forecast = CryptoAnalyzer.generate_multi_horizon_forecast(df_5m, df_4h, df_1d, disp)
+        if not forecast:
+            await interaction.followup.send(f"❌ Failed to generate multi-horizon forecast for `{disp}`.", ephemeral=True)
+            return
+
+        embed = build_forecast_embed(forecast)
+        view = QuickTradeView(disp, forecast.current_price, sl=forecast.macro_invalidation, tp=forecast.mid_term.projected_target)
+        await interaction.followup.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"Error in /forecast: {e}")
         await interaction.followup.send(f"❌ Error: `{str(e)}`", ephemeral=True)
 
 
@@ -1456,6 +1547,29 @@ async def prefix_orderflow(ctx: commands.Context, symbol: str = "BTC/USDT"):
 
         embed = build_orderflow_embed(disp, depth, flow)
         await ctx.send(embed=embed)
+
+
+@bot.command(name="forecast", aliases=["outlook", "trend", "predict"])
+async def prefix_forecast(ctx: commands.Context, symbol: str = "BTC/USDT"):
+    """Usage: !forecast BTC or !forecast GOLD"""
+    disp = format_display_symbol(symbol)
+    async with ctx.typing():
+        df_5m = await mexc_client.get_klines(symbol, interval="5m", limit=80)
+        df_4h = await mexc_client.get_klines(symbol, interval="4h", limit=80)
+        df_1d = await mexc_client.get_klines(symbol, interval="1d", limit=80)
+
+        if df_5m is None or len(df_5m) < 30:
+            await ctx.send(f"❌ Could not fetch market data for `{disp}` from MEXC.")
+            return
+
+        forecast = CryptoAnalyzer.generate_multi_horizon_forecast(df_5m, df_4h, df_1d, disp)
+        if not forecast:
+            await ctx.send(f"❌ Failed to generate multi-horizon forecast for `{disp}`.")
+            return
+
+        embed = build_forecast_embed(forecast)
+        view = QuickTradeView(disp, forecast.current_price, sl=forecast.macro_invalidation, tp=forecast.mid_term.projected_target)
+        await ctx.send(embed=embed, view=view)
 
 
 @bot.command(name="entrypricein", aliases=["track", "follow"])
