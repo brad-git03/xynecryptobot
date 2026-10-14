@@ -11,6 +11,7 @@ import pandas as pd
 
 EXPIRY_MINUTES = 10
 MIN_SAMPLES = 30
+EVENT_HORIZONS = {"10m": (10, 1), "30m": (30, 5), "1h": (60, 5), "1d": (1440, 60)}
 
 
 @dataclass
@@ -29,6 +30,9 @@ class EventSignal:
     index_time: Optional[float] = None
     strategy_version: str = "event-v1"
     research_context: Optional[dict] = None
+    expiry_minutes: int = 10
+    candle_minutes: int = 1
+    data_ready: bool = False
 
 
 def break_even_rate(payout_pct: float) -> float:
@@ -69,17 +73,24 @@ def _features(df: pd.DataFrame):
 
 def analyze_event(df: Optional[pd.DataFrame], index_price: Optional[float],
                   quote_time: Optional[float], up_payout: Optional[float] = None,
-                  down_payout: Optional[float] = None, now: Optional[float] = None) -> EventSignal:
-    """Use closed 1m candles and completed, non-overlapping 10m analogues only.
+                  down_payout: Optional[float] = None, now: Optional[float] = None,
+                  expiry_minutes: int = 10, candle_minutes: int = 1) -> EventSignal:
+    """Use closed index candles and completed, non-overlapping expiry analogues only.
 
     Historical rates are exploratory in-sample observations, not win probabilities.
     A current index quote is required; spot and contract-last-price fallbacks are forbidden.
     """
     now = time.time() if now is None else now
+    if (expiry_minutes, candle_minutes) not in EVENT_HORIZONS.values():
+        raise ValueError("Unsupported expiry/candle combination.")
+    horizon_bars = expiry_minutes // candle_minutes
+    candle_ms = candle_minutes*60000
     for payout in (up_payout, down_payout):
         if payout is not None:
             break_even_rate(payout)
-    result = EventSignal()
+    result = EventSignal(expiry_minutes=expiry_minutes, candle_minutes=candle_minutes)
+    if expiry_minutes != EXPIRY_MINUTES:
+        result.strategy_version = f"event-h{expiry_minutes}-c{candle_minutes}-v1"
     if (index_price is None or not math.isfinite(index_price) or index_price <= 0
             or quote_time is None or not math.isfinite(quote_time) or not 0 <= now-quote_time <= 30):
         result.reason = "A fresh MEXC index quote (within 30 seconds) is unavailable."
@@ -101,16 +112,17 @@ def analyze_event(df: Optional[pd.DataFrame], index_price: Optional[float],
             or (candles["low"] > candles[["open", "close", "high"]].min(axis=1)).any()):
         result.reason = "Invalid index candle prices."
         return result
-    candles = candles[candles["open_time"] + 60000 <= now*1000].reset_index(drop=True)
+    candles = candles[candles["open_time"] + candle_ms <= now*1000].reset_index(drop=True)
     if len(candles) < 100:
-        result.reason = "At least 100 closed one-minute index candles are required."
+        result.reason = f"At least 100 closed {candle_minutes}-minute index candles are required."
         return result
-    if not (candles["open_time"].diff().iloc[1:] == 60000).all():
+    if not (candles["open_time"].diff().iloc[1:] == candle_ms).all():
         result.reason = "Index history has gaps or duplicate minutes; retry when complete."
         return result
-    if not 0 <= now-(candles["open_time"].iloc[-1]/1000+60) <= 90:
+    if not 0 <= now-(candles["open_time"].iloc[-1]/1000+candle_minutes*60) <= candle_minutes*60+30:
         result.reason = "The latest closed index candle is stale."
         return result
+    result.data_ready = True
     directions, atr = _features(candles)
     side = int(directions.iloc[-1])
     if side == 0:
@@ -120,15 +132,15 @@ def analyze_event(df: Optional[pd.DataFrame], index_price: Optional[float],
     result.payout_pct = up_payout if side == 1 else down_payout
     # Sample starts are separated by at least the expiry; no overlapping labels.
     i = 50
-    while i + EXPIRY_MINUTES < len(candles):
+    while i + horizon_bars < len(candles):
         if directions.iloc[i] != side:
             i += 1
             continue
-        move = (candles["close"].iloc[i+EXPIRY_MINUTES] - candles["close"].iloc[i]) * side
+        move = (candles["close"].iloc[i+horizon_bars] - candles["close"].iloc[i]) * side
         result.wins += int(move > 0)
         result.losses += int(move < 0)
         result.ties += int(move == 0)
-        i += EXPIRY_MINUTES
+        i += horizon_bars
     result.samples = result.wins + result.losses + result.ties
     decisive = result.wins + result.losses
     result.lower_win_rate = wilson_lower(result.wins, decisive)

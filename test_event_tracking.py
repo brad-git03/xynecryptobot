@@ -41,6 +41,14 @@ class TrackingTests(unittest.TestCase):
         self.assertEqual(len(self.tracker.due(NOW+599)), 0)
         self.assertEqual(len(self.tracker.due(NOW+600)), 1)
 
+    def test_multi_horizon_alert_cannot_open_a_wrong_duration_paper_entry(self):
+        candidate = signal()
+        candidate.expiry_minutes = 1440
+        paper, message = self.tracker.record("u", "g", "BTC/USDT", candidate, NOW)
+        self.assertIsNone(paper)
+        self.assertIn("10-minute", message)
+        self.assertEqual(self.tracker.report("u", "g")["total"], 0)
+
     def test_settlement_wins_losses_ties_and_payout_math(self):
         for side, exit_price, status, pnl in (("UP", 101, "WIN", .87), ("UP", 99, "LOSS", -1),
                                               ("DOWN", 99, "WIN", .87), ("DOWN", 101, "LOSS", -1),
@@ -111,7 +119,7 @@ class TrackingTests(unittest.TestCase):
 
     def test_discord_embeds_and_command_registration(self):
         # Import without opening the bot's real account databases or connecting Discord.
-        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"):
+        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"), patch("event_alerts.EventAlerts"):
             module = importlib.import_module("bot")
         with patch.object(module, "event_tracker", self.tracker):
             paper = self.record()

@@ -92,14 +92,16 @@ class MEXCClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def get_event_index_history(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Up to 2000 1m index candles. Never substitute spot or contract candles."""
+    async def get_event_index_history(self, symbol: str, interval: str = "1m") -> Optional[pd.DataFrame]:
+        """Up to 2000 index candles. Never substitute spot or contract candles."""
+        if interval not in ("1m", "5m", "1h"):
+            raise ValueError("Event history interval must be 1m, 5m or 1h.")
         _, _, contract_sym = resolve_symbols(symbol)
         session = await self._get_session()
         try:
             async with session.get(
                 f"{MEXC_CONTRACT_API_BASE}/kline/index_price/{contract_sym}",
-                params={"interval": "Min1"},
+                params={"interval": CONTRACT_INTERVAL_MAP[interval]},
             ) as resp:
                 if resp.status != 200:
                     return None

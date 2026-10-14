@@ -15,6 +15,7 @@ from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, res
 from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus, SafeEntrySetup
 from chart_generator import ChartGenerator
 from event_futures import analyze_event, break_even_rate, EventSignal
+from event_alerts import EventAlerts, PAYOUT_ASSUMPTION_LIFETIME, poll_event_alerts
 from event_tracking import EventTracker, STRATEGY_VERSION, settle_due_events
 from event_direction import CHECK_STRATEGY_VERSION, check_direction, normalize_direction
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade, EMAWatch
@@ -34,6 +35,7 @@ bot = commands.Bot(command_prefix=["!", "/"], intents=intents, help_command=None
 mexc_client = MEXCClient()
 paper_trader = PaperTradingManager()
 event_tracker = EventTracker()
+event_alert_settings = EventAlerts()
 
 active_watchlist: List[str] = [
     "GOLD",
@@ -1012,12 +1014,17 @@ async def on_ready():
         event_paper_settlement_loop.start()
         logger.info("Event Futures paper settlement monitor started.")
 
+    if not event_bias_alert_loop.is_running():
+        event_bias_alert_loop.start()
+        logger.info("Event Futures opt-in bias alerts started.")
+
 
 # ==================== ORDER FLOW & LIQUIDITY COMMANDS ====================
 
 def build_event_embed(symbol: str, signal: EventSignal) -> discord.Embed:
+    duration = {10: "10 minutes", 30: "30 minutes", 60: "1 hour", 1440: "1 day"}[signal.expiry_minutes]
     color = 0x2ECC71 if signal.verdict == "UP" else (0xE74C3C if signal.verdict == "DOWN" else 0x95A5A6)
-    embed = discord.Embed(title=f"Event Futures • {symbol} • 10 minutes",
+    embed = discord.Embed(title=f"Event Futures • {symbol} • {duration}",
                           description=f"**{signal.verdict}** — {signal.reason}", color=color)
     embed.add_field(name="Directional bias", value=signal.bias, inline=True)
     if signal.index_price is not None:
@@ -1029,7 +1036,7 @@ def build_event_embed(symbol: str, signal: EventSignal) -> discord.Embed:
     if signal.samples:
         decisive = signal.wins + signal.losses
         rate = f"{signal.wins/decisive*100:.1f}%" if decisive else "N/A"
-        embed.add_field(name="Historical 10m analogues (exploratory)",
+        embed.add_field(name=f"Historical {duration} analogues (exploratory)",
                         value=f"{signal.samples} samples: {signal.wins} wins / {signal.losses} losses / {signal.ties} ties\n"
                               f"Observed win rate excluding ties: {rate}\n"
                               f"95% Wilson lower bound: {signal.lower_win_rate*100:.1f}%", inline=False)
@@ -1037,7 +1044,7 @@ def build_event_embed(symbol: str, signal: EventSignal) -> discord.Embed:
             embed.add_field(name="Historical net return per 1 USDT staked",
                             value=f"{signal.historical_ev:+.3f} USDT at the entered payout", inline=False)
     embed.add_field(name="How to read this", value=(
-        "Expiry is 10 minutes after your actual MEXC entry. Entry and settlement use MEXC's index; "
+        f"Expiry is {duration} after your actual MEXC entry. Entry and settlement use MEXC's index; "
         "this snapshot is not your locked entry price. A win earns the quoted net payout, a loss loses "
         "the stake, and a tie refunds it. Orders cannot be closed early.\n"
         "Historical candle-close analogues are not exact live-entry simulations or calibrated win probabilities. "
@@ -1194,6 +1201,88 @@ async def prefix_eventcheckstats(ctx: commands.Context, symbol: Optional[str] = 
     disp = format_display_symbol(symbol) if symbol else None
     await ctx.send(embed=build_event_report_embed(ctx.author.id, ctx.guild.id if ctx.guild else None, disp,
                                                  version=CHECK_STRATEGY_VERSION))
+
+
+def configure_event_alerts(action: str, user_id: int, guild_id: Optional[int], channel_id: int,
+                           symbol: Optional[str], horizon: str, payout: Optional[float], down_payout: Optional[float]):
+    action, horizon = action.lower(), horizon.lower()
+    scope = guild_id or 0
+    disp = format_display_symbol(symbol) if symbol else None
+    if action == "on":
+        disp = disp or "BTC/USDT"
+        enabled = event_alert_settings.enable(user_id, scope, channel_id, disp, horizon, payout, down_payout)
+        mode = ("Bias only; no payout-based entry approval." if payout is None and down_payout is None else
+                "Configured payouts are assumptions for up to 1 hour. Refresh with the on command when payouts change.")
+        return (f"Enabled {disp}: {', '.join(enabled)} in this channel. Initial readings arrive on the next scan (about a minute).\n"
+                f"{mode}\nUse `!eventalerts off` to stop all your alerts in this server, or `!eventalerts status` to list them.")
+    if action == "off":
+        count = event_alert_settings.disable(user_id, scope, disp, horizon)
+        return f"Turned off {count} of your alerts in this server."
+    if action == "status":
+        rows = event_alert_settings.active(user_id, scope)
+        rows = [r for r in rows if (disp is None or r["symbol"] == disp) and (horizon == "all" or r["horizon"] == horizon)]
+        if not rows:
+            return "No matching active alerts. Enable with `!eventalerts on BTC all` (bias only) or `!eventalerts on BTC 10m 80`."
+        lines = []
+        for row in rows:
+            fresh = 0 <= time.time()-row["updated_at"] <= PAYOUT_ASSUMPTION_LIFETIME
+            mode = "bias only"
+            if row["up_payout"] is not None or row["down_payout"] is not None:
+                mode = (f"assumed payouts UP {row['up_payout'] or 'unset'}% / DOWN {row['down_payout'] or 'unset'}%"
+                        if fresh else "payouts expired; bias only")
+            lines.append(f"{row['symbol']} • {row['horizon']} • <#{row['channel_id']}> • {mode}")
+        return "Your active bias alerts:\n"+"\n".join(lines)
+    raise ValueError("Action must be on, off or status. Example: !eventalerts on BTC all")
+
+
+@bot.tree.command(name="eventalerts", description="Toggle automatic bias/entry-status messages for 10m, 30m, 1h or 1d.")
+@app_commands.choices(action=[app_commands.Choice(name="On", value="on"), app_commands.Choice(name="Off", value="off"),
+                             app_commands.Choice(name="Status", value="status")],
+                      horizon=[app_commands.Choice(name=label, value=value) for label, value in
+                               [("All horizons", "all"), ("10 minutes", "10m"), ("30 minutes", "30m"), ("1 hour", "1h"), ("1 day", "1d")]])
+@app_commands.describe(symbol="Pair (default BTC when enabling; all pairs when disabling)",
+                       payout="Optional assumed UP net payout; expires after 1 hour",
+                       down_payout="Optional different DOWN payout; otherwise uses UP payout")
+async def eventalerts_command(interaction: discord.Interaction, action: str, symbol: Optional[str] = None,
+                              horizon: str = "all", payout: Optional[float] = None, down_payout: Optional[float] = None):
+    try:
+        message = configure_event_alerts(action, interaction.user.id, interaction.guild_id, interaction.channel_id,
+                                          symbol, horizon, payout, down_payout)
+        await interaction.response.send_message(message, ephemeral=True)
+    except ValueError as exc:
+        await interaction.response.send_message(str(exc), ephemeral=True)
+
+
+@bot.command(name="eventalerts", aliases=["biasalerts"])
+async def prefix_eventalerts(ctx: commands.Context, action: str = "status", symbol: Optional[str] = None,
+                             horizon: str = "all", payout: Optional[float] = None, down_payout: Optional[float] = None):
+    try:
+        message = configure_event_alerts(action, ctx.author.id, ctx.guild.id if ctx.guild else None, ctx.channel.id,
+                                          symbol, horizon, payout, down_payout)
+        await ctx.send(message)
+    except ValueError as exc:
+        await ctx.send(str(exc))
+
+
+async def send_event_bias_alert(row, signal, payouts_valid):
+    channel = bot.get_channel(row["channel_id"])
+    if channel is None:
+        channel = await bot.fetch_channel(row["channel_id"])
+    # Check again after channel lookup in case the owner turned off/updated this watch.
+    if not event_alert_settings.is_current(row):
+        return
+    embed = build_event_embed(row["symbol"], signal)
+    embed.title = f"Bias alert • {row['symbol']} • {row['horizon']}"
+    embed.add_field(name="Entry status", value=(
+        "SUPPORTED by the chart/history screen at your assumed payout." if signal.verdict in ("UP", "DOWN")
+        else "WAIT — entry is not supported by this screen."), inline=False)
+    configured = row["up_payout"] is not None or row["down_payout"] is not None
+    mode = ("Configured payout assumptions, not live exchange payouts. Refresh them when they change."
+            if configured and payouts_valid else "Bias-only mode: payouts unset or expired; no entry approval.")
+    embed.add_field(name="Alert settings", value=f"{mode}\nChecks about once a minute; sends state changes. "
+                    "Use !eventalerts off to disable. Alerts do not open paper or real positions.", inline=False)
+    await channel.send(content=f"<@{row['user_id']}> **{row['horizon']} bias: {signal.bias} • {signal.verdict}**",
+                       embed=embed, allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=int(row["user_id"]))]))
 
 
 @bot.tree.command(name="event", description="10-minute Event Futures: index-based Up / Down / Wait entry research.")
@@ -3377,6 +3466,21 @@ async def event_paper_settlement_loop():
 
 @event_paper_settlement_loop.before_loop
 async def before_event_settlement():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def event_bias_alert_loop():
+    try:
+        errors = await poll_event_alerts(event_alert_settings, mexc_client, send_event_bias_alert)
+        for error in errors:
+            logger.warning("Event bias alert: %s", error)
+    except Exception:
+        logger.exception("Event bias alert scan failed; will retry")
+
+
+@event_bias_alert_loop.before_loop
+async def before_event_bias_alerts():
     await bot.wait_until_ready()
 
 async def main():

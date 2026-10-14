@@ -40,6 +40,8 @@ class EventTracker:
         now = time.time() if now is None else now
         if signal.verdict not in ("UP", "DOWN"):
             return None, "WAIT signals do not open paper trades."
+        if signal.expiry_minutes != EXPIRY_MINUTES:
+            return None, "Paper entries currently support 10-minute signals only; horizon alerts do not open trades."
         if signal.payout_pct is None:
             return None, "Paper tracking needs a payout."
         break_even_rate(signal.payout_pct)

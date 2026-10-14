@@ -111,7 +111,7 @@ class DirectionTests(unittest.TestCase):
 
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_requested_payout_is_never_assigned_to_opposite_side(self):
-        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"):
+        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"), patch("event_alerts.EventAlerts"):
             module = importlib.import_module("bot")
         for side in ("UP", "DOWN"):
             with patch.object(module.mexc_client, "get_event_index_history", AsyncMock(return_value=None)), \
@@ -140,7 +140,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all("contract.mexc.com" in url for url in session.urls))
 
     async def test_check_commands_register_and_embed_explains_requested_side(self):
-        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"):
+        with patch("paper_trading.PaperTradingManager"), patch("event_tracking.EventTracker"), patch("event_alerts.EventAlerts"):
             module = importlib.import_module("bot")
         result = check_direction(base(verdict="WAIT"), "UP", 80, pressure(), NOW)
         embed = module.build_direction_check_embed("BTC/USDT", result, 1, 2)

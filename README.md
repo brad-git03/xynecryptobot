@@ -152,6 +152,54 @@ the requested side are stored with each check's entry snapshot.
 Run all feature checks:
 `python -m unittest test_event_futures test_event_tracking test_event_direction -v`.
 
+### Toggle automatic bias messages
+
+Enable alerts in the channel where you want to receive them:
+
+```text
+!eventalerts on BTC all
+!eventalerts on BTC 10m 80
+!eventalerts on ETH 30m 80 75
+!eventalerts on BTC 1h 80
+!eventalerts on BTC 1d 80
+!eventalerts status
+!eventalerts off BTC 10m
+!eventalerts off
+```
+
+The slash equivalent is `/eventalerts action:on symbol:BTC horizon:all`. Horizons are
+`10m`, `30m`, `1h`, `1d`, or `all`. Omitted symbol defaults to BTC when enabling;
+`off` with no symbol disables **all your alerts in this server**. Alerts belong to the
+user who enabled them. Enabling an existing pair/horizon updates it and moves it to
+the current channel. Settings persist in `event_alerts.db`; preserve this file on cloud
+hosts. At most 16 pair/horizon subscriptions can be active per user per server.
+
+Each watch sends an initial reading, then changes in bias, entry approval or data
+availability. Scans run approximately once per minute. Unchanged readings stay quiet;
+ordinary changes have a five-minute notification cooldown. Withdrawals of an earlier
+UP/DOWN approval send immediately on the next scan, including data loss. Failed sends
+are retried, and disabling a watch stops future notifications. This is a background
+bot feature: the bot must stay running and have permission to send in the channel.
+
+The 10-minute horizon uses 1-minute index candles, 30 minutes and 1 hour use 5-minute
+candles, and 1 day uses hourly candles. Historical labels are evaluated at the selected
+expiry with non-overlapping windows. A daily reading is not a 10-minute signal relabelled.
+All horizons require sufficient completed samples and fresh index data. The automatic
+watch uses the chart/history screen; it does not apply the experimental short-lived
+volume filter from `eventcheck`. Alerts do not open paper trades or real orders.
+
+Without payout arguments, alerts show **bias only**, with WAIT for entry approval.
+With payouts, UP/DOWN means the chart/history screen passes at your **configured
+assumed payout**, not a live quote from Event Futures. One payout applies to both
+sides unless a different DOWN payout is supplied. Payout assumptions expire after
+one hour; alerts then continue in bias-only mode. Refresh using the `on` command when
+MEXC payouts change, and configure different horizons separately if payouts differ.
+Verify that the pair and expiry are offered in your MEXC account. No accuracy improvement
+or guaranteed outcome is implied by an automated alert.
+
+Run the complete offline suite:
+`python -m unittest test_event_futures test_event_tracking test_event_direction test_event_alerts -v`.
+
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/analyze <symbol> [timeframe]` | Deep-dive signal card with live chart & technical breakdown | `/analyze symbol:BTC/USDT timeframe:5m` |
