@@ -27,6 +27,8 @@ class EventSignal:
     lower_win_rate: Optional[float] = None
     historical_ev: Optional[float] = None
     index_time: Optional[float] = None
+    strategy_version: str = "event-v1"
+    research_context: Optional[dict] = None
 
 
 def break_even_rate(payout_pct: float) -> float:

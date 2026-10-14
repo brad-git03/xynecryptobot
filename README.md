@@ -121,6 +121,37 @@ mean the report alone does not establish a calibrated win probability or a profi
 Run all Event Futures checks:
 `python -m unittest test_event_futures test_event_tracking -v`.
 
+### Check a direction you already have in mind
+
+Use **`!eventcheck BTC UP 80`** or **`!eventcheck BTC DOWN 80`**. The slash equivalent
+is `/eventcheck symbol:BTC/USDT direction:UP payout:80`. The payout is for your chosen
+side only; the bot never assumes the opposite side has the same payout.
+
+The check combines the existing 10-minute index-chart/history screen (EMA alignment,
+RSI, momentum, overextension and payout threshold) with an experimental futures
+liquidity/volume filter. UP requires at least 58% bid liquidity and 60% taker-buy
+volume; DOWN requires at least 58% ask liquidity and 60% taker-sell volume. A fresh
+book covers the nearest 20 levels per side; executed-volume shares cover up to 100
+non-self trades from the last 60 seconds, requiring at least 20 trades. Book and latest
+eligible trade timestamps must be within 10 seconds, allowing up to two seconds of
+exchange clock skew. Missing, stale, balanced or
+conflicting evidence returns WAIT. Volume cannot turn a chart WAIT into an entry.
+
+The response explains whether **your requested direction** is supported and shows
+the chart bias and both pressure readings. WAIT does not mean the opposite direction
+is approved. These are perpetual-futures context indicators, not Event Futures order
+flow. Historical analogue rates describe the chart screen only; they do not validate
+the extra live-pressure filter. No improved win rate or guarantee is claimed.
+
+Qualifying checks are automatically paper-tracked as strategy `event-check-v1`.
+Use `!eventcheckstats` or `/eventcheckstats` (optional symbol filter) for their forward
+results, separately from `!eventstats` for the original chart strategy. The existing
+one-pending-entry-per-pair rule applies across both strategies. Pressure readings and
+the requested side are stored with each check's entry snapshot.
+
+Run all feature checks:
+`python -m unittest test_event_futures test_event_tracking test_event_direction -v`.
+
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/analyze <symbol> [timeframe]` | Deep-dive signal card with live chart & technical breakdown | `/analyze symbol:BTC/USDT timeframe:5m` |

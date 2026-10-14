@@ -16,6 +16,7 @@ from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendatio
 from chart_generator import ChartGenerator
 from event_futures import analyze_event, break_even_rate, EventSignal
 from event_tracking import EventTracker, STRATEGY_VERSION, settle_due_events
+from event_direction import CHECK_STRATEGY_VERSION, check_direction, normalize_direction
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade, EMAWatch
 
 # Logging configuration
@@ -1065,10 +1066,11 @@ def build_tracked_event_embed(symbol: str, signal: EventSignal, user_id: int, gu
     return embed
 
 
-def build_event_report_embed(user_id: int, guild_id: Optional[int], symbol: Optional[str] = None):
-    report = event_tracker.report(user_id, guild_id or 0, symbol)
+def build_event_report_embed(user_id: int, guild_id: Optional[int], symbol: Optional[str] = None,
+                             version: str = STRATEGY_VERSION):
+    report = event_tracker.report(user_id, guild_id or 0, symbol, version=version)
     embed = discord.Embed(title=f"Event Futures paper report • {symbol or 'All pairs'}",
-                          description=f"Your forward results in this server • Strategy {STRATEGY_VERSION}\n"
+                          description=f"Your forward results in this server • Strategy {version}\n"
                                       "Fixed virtual stake: 1 USDT per entry. User-entered payouts are locked at entry.",
                           color=0x3498DB)
     embed.add_field(name="Coverage", value=f"{report['total']} entries • {report['settled']} settled\n"
@@ -1086,7 +1088,8 @@ def build_event_report_embed(user_id: int, guild_id: Optional[int], symbol: Opti
             embed.add_field(name=side, value=f"{stats['trades']} settled • {stats['wins']}W / {stats['losses']}L\n"
                             f"{stats['pnl']:+.3f} USDT", inline=True)
     else:
-        embed.add_field(name="No settled results yet", value="Run !event BTC 80 with the current payout. Qualifying UP/DOWN signals "
+        example = "!eventcheck BTC UP 80" if version == CHECK_STRATEGY_VERSION else "!event BTC 80"
+        embed.add_field(name="No settled results yet", value=f"Run {example} with the current payout. Qualifying UP/DOWN signals "
                         "are recorded automatically; WAIT signals are not entered. Check back after 10 minutes.", inline=False)
     if report["recent"]:
         lines = []
@@ -1114,6 +1117,83 @@ async def eventstats_command(interaction: discord.Interaction, symbol: Optional[
 async def prefix_eventstats(ctx: commands.Context, symbol: Optional[str] = None):
     disp = format_display_symbol(symbol) if symbol else None
     await ctx.send(embed=build_event_report_embed(ctx.author.id, ctx.guild.id if ctx.guild else None, disp))
+
+
+async def get_direction_check(symbol: str, direction: str, payout: float) -> EventSignal:
+    direction = normalize_direction(direction)
+    break_even_rate(payout)
+    history, pressure = await asyncio.gather(mexc_client.get_event_index_history(symbol),
+                                             mexc_client.get_event_market_context(symbol))
+    quote = await mexc_client.get_event_index_quote(symbol)
+    # Only the user's chosen side has a known payout; never assume the opposite pays the same.
+    base = analyze_event(history, quote["price"] if quote else None, quote["time"] if quote else None,
+                         payout if direction == "UP" else None, payout if direction == "DOWN" else None)
+    return check_direction(base, direction, payout, pressure)
+
+
+def build_direction_check_embed(symbol: str, signal: EventSignal, user_id: int, guild_id: Optional[int]):
+    requested = signal.research_context["requested_direction"]
+    embed = build_tracked_event_embed(symbol, signal, user_id, guild_id)
+    embed.title = f"Check {requested} • {symbol} • 10 minutes"
+    context = signal.research_context
+    bid, buy = context.get("bid_pct"), context.get("taker_buy_pct")
+    book = f"{bid:.1f}% bids / {100-bid:.1f}% asks" if bid is not None else "Unavailable or stale"
+    flow = (f"{buy:.1f}% buy / {100-buy:.1f}% sell volume across {context['trade_count']} trades"
+            if buy is not None else "Unavailable, stale, or fewer than 20 eligible trades")
+    embed.add_field(name="Futures order book (nearest 20 levels per side)", value=book, inline=False)
+    embed.add_field(name="Futures executed volume (up to 100 trades in the last 60s)", value=flow, inline=False)
+    embed.add_field(name="What this check means", value=f"UP/DOWN means your requested {requested} passes both screens. "
+                    "WAIT means it does not; it is not an instruction to enter the opposite direction. "
+                    f"Historical analogues above describe the {signal.bias} chart bias only; they do not include this live-volume filter. "
+                    "Futures liquidity and executed volume are contextual proxies, not Event Futures order flow or settlement prices. "
+                    "The filter is experimental; evaluate its forward results separately with !eventcheckstats.", inline=False)
+    return embed
+
+
+@bot.tree.command(name="eventcheck", description="Check your chosen UP/DOWN against 10m charts, history and live futures volume.")
+@app_commands.describe(symbol="Pair, e.g. BTC/USDT", direction="The side you want to assess",
+                       payout="Current net-profit payout percent for your chosen side")
+@app_commands.choices(direction=[app_commands.Choice(name="UP", value="UP"), app_commands.Choice(name="DOWN", value="DOWN")])
+async def eventcheck_command(interaction: discord.Interaction, symbol: str,
+                             direction: app_commands.Choice[str], payout: float):
+    await interaction.response.defer(thinking=True)
+    try:
+        signal = await get_direction_check(symbol, direction.value, payout)
+        await interaction.followup.send(embed=build_direction_check_embed(format_display_symbol(symbol), signal,
+                                                                         interaction.user.id, interaction.guild_id))
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+    except Exception:
+        logger.exception("Event direction check failed")
+        await interaction.followup.send("Direction check unavailable; wait and retry.", ephemeral=True)
+
+
+@bot.command(name="eventcheck")
+async def prefix_eventcheck(ctx: commands.Context, symbol: str, direction: str, payout: float):
+    async with ctx.typing():
+        try:
+            signal = await get_direction_check(symbol, direction, payout)
+            await ctx.send(embed=build_direction_check_embed(format_display_symbol(symbol), signal,
+                                                            ctx.author.id, ctx.guild.id if ctx.guild else None))
+        except ValueError as exc:
+            await ctx.send(str(exc))
+        except Exception:
+            logger.exception("Event direction check failed")
+            await ctx.send("Direction check unavailable; wait and retry.")
+
+
+@bot.tree.command(name="eventcheckstats", description="Forward paper results for the experimental chosen-direction volume filter.")
+async def eventcheckstats_command(interaction: discord.Interaction, symbol: Optional[str] = None):
+    disp = format_display_symbol(symbol) if symbol else None
+    await interaction.response.send_message(embed=build_event_report_embed(interaction.user.id, interaction.guild_id, disp,
+                                                                         version=CHECK_STRATEGY_VERSION))
+
+
+@bot.command(name="eventcheckstats")
+async def prefix_eventcheckstats(ctx: commands.Context, symbol: Optional[str] = None):
+    disp = format_display_symbol(symbol) if symbol else None
+    await ctx.send(embed=build_event_report_embed(ctx.author.id, ctx.guild.id if ctx.guild else None, disp,
+                                                 version=CHECK_STRATEGY_VERSION))
 
 
 @bot.tree.command(name="event", description="10-minute Event Futures: index-based Up / Down / Wait entry research.")

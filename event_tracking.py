@@ -59,11 +59,12 @@ class EventTracker:
                 (user_id, scope_id, symbol, version, direction, entry_price, entry_time,
                  entry_quote_time, expires_at, payout_pct, snapshot)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (str(user_id), str(scope_id), symbol, STRATEGY_VERSION, signal.verdict,
+                (str(user_id), str(scope_id), symbol, signal.strategy_version, signal.verdict,
                  signal.index_price, now, signal.index_time, now+EXPIRY_MINUTES*60,
                  signal.payout_pct, json.dumps(asdict(signal))))
             paper_id = cursor.lastrowid
-        return paper_id, f"Paper #{paper_id} opened: 1 USDT virtual stake, 10-minute expiry. Use !eventstats for results."
+        command = "!eventstats" if signal.strategy_version == STRATEGY_VERSION else "!eventcheckstats"
+        return paper_id, f"Paper #{paper_id} opened: 1 USDT virtual stake, 10-minute expiry. Use {command} for results."
 
     def due(self, now=None):
         now = time.time() if now is None else now
@@ -104,10 +105,10 @@ class EventTracker:
                 return "MISSED"
         return None
 
-    def report(self, user_id, scope_id, symbol=None):
+    def report(self, user_id, scope_id, symbol=None, version=STRATEGY_VERSION):
         with closing(self._connect()) as conn:
             query = "SELECT * FROM event_papers WHERE user_id=? AND scope_id=? AND version=?"
-            args = [str(user_id), str(scope_id), STRATEGY_VERSION]
+            args = [str(user_id), str(scope_id), version]
             if symbol:
                 query += " AND symbol=?"
                 args.append(symbol)

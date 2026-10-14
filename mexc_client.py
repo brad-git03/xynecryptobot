@@ -117,6 +117,26 @@ class MEXCClient:
             logger.warning("Event index history unavailable for %s: %s", symbol, exc)
             return None
 
+    async def get_event_market_context(self, symbol: str) -> Dict[str, Any]:
+        """Timestamped futures-only inputs for the experimental direction filter."""
+        from event_direction import summarize_pressure
+        _, _, contract_sym = resolve_symbols(symbol)
+        session = await self._get_session()
+
+        async def fetch(path, params):
+            try:
+                async with session.get(f"{MEXC_CONTRACT_API_BASE}/{path}/{contract_sym}", params=params) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json()
+                        if payload.get("success"):
+                            return payload.get("data")
+            except Exception as exc:
+                logger.debug("Event direction context unavailable for %s: %s", symbol, exc)
+            return None
+
+        depth, trades = await asyncio.gather(fetch("depth", {"limit": 20}), fetch("deals", {"limit": 100}))
+        return summarize_pressure(depth, trades)
+
     async def get_event_index_quote(self, symbol: str) -> Optional[Dict[str, float]]:
         """Return the settlement reference index and exchange timestamp, not lastPrice."""
         _, _, contract_sym = resolve_symbols(symbol)
