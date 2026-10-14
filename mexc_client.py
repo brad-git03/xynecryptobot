@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import re
 from typing import Optional, List, Dict, Any, Tuple
 import aiohttp
@@ -90,6 +91,51 @@ class MEXCClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
+
+    async def get_event_index_history(self, symbol: str) -> Optional[pd.DataFrame]:
+        """Up to 2000 1m index candles. Never substitute spot or contract candles."""
+        _, _, contract_sym = resolve_symbols(symbol)
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{MEXC_CONTRACT_API_BASE}/kline/index_price/{contract_sym}",
+                params={"interval": "Min1"},
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+                if not payload.get("success"):
+                    return None
+                data = payload.get("data", {})
+                df = pd.DataFrame({
+                    "open_time": [float(t)*1000 for t in data.get("time", [])],
+                    **{key: [float(v) for v in data.get(key, [])]
+                       for key in ("open", "high", "low", "close")},
+                })
+                return df.sort_values("open_time").reset_index(drop=True)
+        except Exception as exc:
+            logger.warning("Event index history unavailable for %s: %s", symbol, exc)
+            return None
+
+    async def get_event_index_quote(self, symbol: str) -> Optional[Dict[str, float]]:
+        """Return the settlement reference index and exchange timestamp, not lastPrice."""
+        _, _, contract_sym = resolve_symbols(symbol)
+        session = await self._get_session()
+        try:
+            async with session.get(f"{MEXC_CONTRACT_API_BASE}/ticker", params={"symbol": contract_sym}) as resp:
+                if resp.status != 200:
+                    return None
+                payload = await resp.json()
+                if not payload.get("success"):
+                    return None
+                data = payload.get("data", {})
+                price = float(data["indexPrice"])
+                timestamp = float(data["timestamp"])/1000
+                if price > 0 and math.isfinite(price) and math.isfinite(timestamp):
+                    return {"price": price, "time": timestamp}
+        except Exception as exc:
+            logger.warning("Event index quote unavailable for %s: %s", symbol, exc)
+        return None
 
     async def get_klines(
         self, symbol: str, interval: str = "5m", limit: int = 120

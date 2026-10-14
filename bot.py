@@ -14,6 +14,7 @@ import config
 from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, resolve_symbols
 from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus, SafeEntrySetup
 from chart_generator import ChartGenerator
+from event_futures import analyze_event, break_even_rate, EventSignal
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade, EMAWatch
 
 # Logging configuration
@@ -1006,6 +1007,79 @@ async def on_ready():
 
 
 # ==================== ORDER FLOW & LIQUIDITY COMMANDS ====================
+
+def build_event_embed(symbol: str, signal: EventSignal) -> discord.Embed:
+    color = 0x2ECC71 if signal.verdict == "UP" else (0xE74C3C if signal.verdict == "DOWN" else 0x95A5A6)
+    embed = discord.Embed(title=f"Event Futures • {symbol} • 10 minutes",
+                          description=f"**{signal.verdict}** — {signal.reason}", color=color)
+    embed.add_field(name="Directional bias", value=signal.bias, inline=True)
+    if signal.index_price is not None:
+        embed.add_field(name="Reference index now", value=f"{signal.index_price:.10g} USDT", inline=True)
+    if signal.payout_pct is not None:
+        embed.add_field(name="Quoted net payout", value=f"{signal.payout_pct:g}%", inline=True)
+        embed.add_field(name="Break-even win rate (excluding ties)",
+                        value=f"{break_even_rate(signal.payout_pct)*100:.2f}%", inline=True)
+    if signal.samples:
+        decisive = signal.wins + signal.losses
+        rate = f"{signal.wins/decisive*100:.1f}%" if decisive else "N/A"
+        embed.add_field(name="Historical 10m analogues (exploratory)",
+                        value=f"{signal.samples} samples: {signal.wins} wins / {signal.losses} losses / {signal.ties} ties\n"
+                              f"Observed win rate excluding ties: {rate}\n"
+                              f"95% Wilson lower bound: {signal.lower_win_rate*100:.1f}%", inline=False)
+        if signal.historical_ev is not None:
+            embed.add_field(name="Historical net return per 1 USDT staked",
+                            value=f"{signal.historical_ev:+.3f} USDT at the entered payout", inline=False)
+    embed.add_field(name="How to read this", value=(
+        "Expiry is 10 minutes after your actual MEXC entry. Entry and settlement use MEXC's index; "
+        "this snapshot is not your locked entry price. A win earns the quoted net payout, a loss loses "
+        "the stake, and a tie refunds it. Orders cannot be closed early.\n"
+        "Historical candle-close analogues are not exact live-entry simulations or calibrated win probabilities. "
+        "Payouts can differ for Up and Down. Confirm the pair, expiry and payout in MEXC."), inline=False)
+    embed.set_footer(text="Research signal • No automatic trading • Re-run before entry • No guaranteed outcome")
+    return embed
+
+
+async def get_event_signal(symbol: str, up_payout: Optional[float], down_payout: Optional[float]) -> EventSignal:
+    # Validate before network requests. A single supplied payout explicitly applies to both sides.
+    for payout in (up_payout, down_payout):
+        if payout is not None:
+            break_even_rate(payout)
+    history = await mexc_client.get_event_index_history(symbol)
+    # Fetch quote after history so it is as recent as possible when displayed.
+    quote = await mexc_client.get_event_index_quote(symbol)
+    return analyze_event(history, quote["price"] if quote else None, quote["time"] if quote else None,
+                         up_payout, down_payout if down_payout is not None else up_payout)
+
+
+@bot.tree.command(name="event", description="10-minute Event Futures: index-based Up / Down / Wait entry research.")
+@app_commands.describe(symbol="Pair offered in MEXC Event Futures, e.g. BTC/USDT",
+                       payout="Current net-profit payout percent for Up (also Down unless down_payout is provided)",
+                       down_payout="Down net-profit payout percent if different from Up")
+async def event_command(interaction: discord.Interaction, symbol: str = "BTC/USDT",
+                        payout: Optional[float] = None, down_payout: Optional[float] = None):
+    await interaction.response.defer(thinking=True)
+    try:
+        signal = await get_event_signal(symbol, payout, down_payout)
+        await interaction.followup.send(embed=build_event_embed(format_display_symbol(symbol), signal))
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+    except Exception:
+        logger.exception("Event Futures analysis failed")
+        await interaction.followup.send("Event analysis is unavailable; wait and retry.", ephemeral=True)
+
+
+@bot.command(name="event", aliases=["eventfutures", "updown"])
+async def prefix_event(ctx: commands.Context, symbol: str = "BTC/USDT", payout: Optional[float] = None,
+                       down_payout: Optional[float] = None):
+    async with ctx.typing():
+        try:
+            signal = await get_event_signal(symbol, payout, down_payout)
+            await ctx.send(embed=build_event_embed(format_display_symbol(symbol), signal))
+        except ValueError as exc:
+            await ctx.send(str(exc))
+        except Exception:
+            logger.exception("Event Futures analysis failed")
+            await ctx.send("Event analysis is unavailable; wait and retry.")
 
 @bot.tree.command(name="orderflow", description="🌊 Live Order Flow & Depth: Checks real-time Order Book, Taker Volume & Whale Trades.")
 @app_commands.describe(symbol="Trading pair symbol (e.g. BTC/USDT, GOLD, ETH/USDT, SOL/USDT)")

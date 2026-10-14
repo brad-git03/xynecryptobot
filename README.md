@@ -57,6 +57,36 @@ python bot.py
 
 ## ⚡ Slash Commands in Discord
 
+### Event Futures (10-minute expiry)
+
+Use `/event symbol:BTC/USDT payout:80` or `!event BTC 80` for an **UP / DOWN / WAIT**
+research signal. Enter the **net-profit payout percentage currently shown in MEXC**;
+80 means a win earns 0.80 USDT per 1 USDT staked, in addition to the returned stake.
+If Down has a different payout, use `/event symbol:BTC/USDT payout:80 down_payout:75`
+or `!event BTC 80 75`. One payout applies to both directions. Omitting payout produces
+analysis with a WAIT verdict. Aliases: `!updown`, `!eventfutures`.
+
+This feature uses MEXC **index** candles and a fresh index quote, never spot or perpetual
+last-trade prices. It screens EMA 9/21/50 alignment, RSI, momentum and overextension,
+then checks completed, non-overlapping 10-minute historical analogues. Entry requires
+at least 30 non-tied observations and a 95% Wilson lower bound above the payout's
+break-even win rate plus two percentage points. At 80% payout, break-even is 55.56%
+among non-tied outcomes. Stale, incomplete or conflicting evidence returns WAIT.
+
+Historical rates and returns are exploratory, based on up to 2000 minutes of index
+history. They are **not calibrated probabilities or an independently validated edge**;
+candle-close entries differ from your actual entry second, observations can remain
+correlated, and current payouts are applied retrospectively. The command is a snapshot,
+not a promise about the next 10 minutes. Re-run before entry and verify that the pair
+is offered in Event Futures. It does not execute or automatically settle trades.
+
+Under [MEXC's Event Futures rules](https://www.mexc.co/support/article/how-to-use-event-futures-on-mexc-a-simple-and-accessible-futures-trading-method-395277582692768768),
+the index at expiry determines the outcome; a tie refunds the stake, a wrong direction
+loses it, and positions cannot be closed early. MEXC currently does not offer Event
+Futures API trading. Payouts can change before you submit an order.
+
+Run the offline feature checks with `python -m unittest test_event_futures -v`.
+
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/analyze <symbol> [timeframe]` | Deep-dive signal card with live chart & technical breakdown | `/analyze symbol:BTC/USDT timeframe:5m` |
