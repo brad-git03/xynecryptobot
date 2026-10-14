@@ -87,6 +87,40 @@ Futures API trading. Payouts can change before you submit an order.
 
 Run the offline feature checks with `python -m unittest test_event_futures -v`.
 
+### Automatic forward paper-tracking
+
+Each qualifying UP/DOWN response from `/event` or `!event` automatically records a
+**1 USDT virtual stake** at the displayed index price, using the entered payout and a
+10-minute expiry measured from recording time. No real order is placed. WAIT signals
+are not entered. Recording requires an index quote no more than five seconds old.
+There is one pending paper entry per user/pair/server; repeated commands do not add
+overlapping entries. This tracks command-triggered signals, not a continuous scanner.
+
+Use `!eventstats` (alias `!eventreport`) or `/eventstats` for your results in the current
+server. Filter with `!eventstats BTC` or `/eventstats symbol:BTC/USDT`. The report shows
+pending/settled/missed entries, wins/losses/ties, win rate excluding ties, a Wilson lower
+bound, payout-adjusted net return, ROI on settled stakes, maximum drawdown, longest
+losing streak, separate Up/Down results, and the latest five entries. All-tie or empty
+results show no win rate, rather than an invented accuracy figure. Strategy versions
+are kept separate so later rule changes can be evaluated without blending their results.
+
+The bot polls due entries every two seconds. Settlement uses a fresh MEXC index quote
+timestamped from expiry through five seconds after expiry. This is an **approximate
+paper settlement**, not MEXC's exact-second settlement; the report displays quote delay.
+If a suitable quote cannot be captured by 15 seconds after expiry (including downtime),
+the entry becomes MISSED and is excluded from win rate and returns. Missing results
+can bias the remaining sample; review the missed count alongside performance.
+
+Records persist in `event_tracking.db`, separate from the existing leveraged paper
+accounts. Account resets do not erase this research record. Back up the database and
+use persistent disk storage on cloud hosts; ephemeral deployments can lose it.
+Restarts resume pending checks and mark expired entries with missing quotes as MISSED.
+These are forward observations, but shared/correlated signals and user-selected payouts
+mean the report alone does not establish a calibrated win probability or a profitable edge.
+
+Run all Event Futures checks:
+`python -m unittest test_event_futures test_event_tracking -v`.
+
 | Command | Description | Example |
 | :--- | :--- | :--- |
 | `/analyze <symbol> [timeframe]` | Deep-dive signal card with live chart & technical breakdown | `/analyze symbol:BTC/USDT timeframe:5m` |

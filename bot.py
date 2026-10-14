@@ -15,6 +15,7 @@ from mexc_client import MEXCClient, format_display_symbol, normalize_symbol, res
 from analyzer import CryptoAnalyzer, TechnicalAnalysisResult, ScalpRecommendation, PreOrderSetup, SwingSetup, MultiHorizonForecast, HorizonStatus, SafeEntrySetup
 from chart_generator import ChartGenerator
 from event_futures import analyze_event, break_even_rate, EventSignal
+from event_tracking import EventTracker, STRATEGY_VERSION, settle_due_events
 from paper_trading import PaperTradingManager, Position, AccountSummary, TrackedTrade, EMAWatch
 
 # Logging configuration
@@ -31,6 +32,7 @@ bot = commands.Bot(command_prefix=["!", "/"], intents=intents, help_command=None
 
 mexc_client = MEXCClient()
 paper_trader = PaperTradingManager()
+event_tracker = EventTracker()
 
 active_watchlist: List[str] = [
     "GOLD",
@@ -1005,6 +1007,10 @@ async def on_ready():
         ema_sentinel_loop.start()
         logger.info("Real-Time EMA Sentinel started (Monitoring active EMA watches every 12s).")
 
+    if not event_paper_settlement_loop.is_running():
+        event_paper_settlement_loop.start()
+        logger.info("Event Futures paper settlement monitor started.")
+
 
 # ==================== ORDER FLOW & LIQUIDITY COMMANDS ====================
 
@@ -1051,6 +1057,65 @@ async def get_event_signal(symbol: str, up_payout: Optional[float], down_payout:
                          up_payout, down_payout if down_payout is not None else up_payout)
 
 
+def build_tracked_event_embed(symbol: str, signal: EventSignal, user_id: int, guild_id: Optional[int]):
+    embed = build_event_embed(symbol, signal)
+    if signal.verdict in ("UP", "DOWN"):
+        _, message = event_tracker.record(user_id, guild_id or 0, symbol, signal)
+        embed.add_field(name="Automatic paper tracking", value=message, inline=False)
+    return embed
+
+
+def build_event_report_embed(user_id: int, guild_id: Optional[int], symbol: Optional[str] = None):
+    report = event_tracker.report(user_id, guild_id or 0, symbol)
+    embed = discord.Embed(title=f"Event Futures paper report • {symbol or 'All pairs'}",
+                          description=f"Your forward results in this server • Strategy {STRATEGY_VERSION}\n"
+                                      "Fixed virtual stake: 1 USDT per entry. User-entered payouts are locked at entry.",
+                          color=0x3498DB)
+    embed.add_field(name="Coverage", value=f"{report['total']} entries • {report['settled']} settled\n"
+                    f"{report['open']} pending • {report['missed']} missed expiries", inline=False)
+    if report["settled"]:
+        rate = f"{report['win_rate']*100:.1f}%" if report["win_rate"] is not None else "N/A (all ties)"
+        lower = f"{report['lower_win_rate']*100:.1f}%" if report["lower_win_rate"] is not None else "N/A"
+        embed.add_field(name="Forward outcomes", value=f"{report['wins']} wins / {report['losses']} losses / {report['ties']} ties\n"
+                        f"Win rate excluding ties: {rate}\n95% Wilson lower bound: {lower}", inline=False)
+        embed.add_field(name="Payout-adjusted paper return", value=f"{report['pnl']:+.3f} USDT net\n"
+                        f"{report['roi']*100:+.2f}% of settled stakes\n"
+                        f"Max drawdown: {report['max_drawdown']:.3f} USDT\n"
+                        f"Longest consecutive losses: {report['worst_loss_streak']}", inline=False)
+        for side, stats in report["by_side"].items():
+            embed.add_field(name=side, value=f"{stats['trades']} settled • {stats['wins']}W / {stats['losses']}L\n"
+                            f"{stats['pnl']:+.3f} USDT", inline=True)
+    else:
+        embed.add_field(name="No settled results yet", value="Run !event BTC 80 with the current payout. Qualifying UP/DOWN signals "
+                        "are recorded automatically; WAIT signals are not entered. Check back after 10 minutes.", inline=False)
+    if report["recent"]:
+        lines = []
+        for row in report["recent"]:
+            pnl = f" ({row['pnl']:+.2f} USDT)" if row["pnl"] is not None else ""
+            lag = f" • +{row['exit_quote_time']-row['expires_at']:.1f}s quote" if row["exit_quote_time"] is not None else ""
+            lines.append(f"#{row['id']} {row['symbol']} {row['direction']} • {row['status']}{pnl}{lag}")
+        embed.add_field(name="Latest entries", value="\n".join(lines), inline=False)
+    embed.add_field(name="Measurement limits", value="Forward paper observations, not actual MEXC fills. Entry quotes must be within 5 seconds. "
+                    "Settlement uses a fresh index quote from expiry through 5 seconds after expiry; exact-second MEXC outcomes may differ. "
+                    "Unavailable expiry quotes are marked MISSED and excluded from returns and win rate. "
+                    "One pending entry per user/pair in this server prevents duplicate signals inflating results. "
+                    "Results are command-triggered and may remain correlated across pairs/users. Paper performance does not guarantee future wins.", inline=False)
+    return embed
+
+
+@bot.tree.command(name="eventstats", description="Your forward Event Futures paper results, win rate and payout-adjusted returns.")
+@app_commands.describe(symbol="Optional pair filter, e.g. BTC/USDT")
+async def eventstats_command(interaction: discord.Interaction, symbol: Optional[str] = None):
+    disp = format_display_symbol(symbol) if symbol else None
+    await interaction.response.send_message(embed=build_event_report_embed(interaction.user.id, interaction.guild_id, disp))
+
+
+@bot.command(name="eventstats", aliases=["eventreport"])
+async def prefix_eventstats(ctx: commands.Context, symbol: Optional[str] = None):
+    disp = format_display_symbol(symbol) if symbol else None
+    await ctx.send(embed=build_event_report_embed(ctx.author.id, ctx.guild.id if ctx.guild else None, disp))
+
+
 @bot.tree.command(name="event", description="10-minute Event Futures: index-based Up / Down / Wait entry research.")
 @app_commands.describe(symbol="Pair offered in MEXC Event Futures, e.g. BTC/USDT",
                        payout="Current net-profit payout percent for Up (also Down unless down_payout is provided)",
@@ -1060,7 +1125,8 @@ async def event_command(interaction: discord.Interaction, symbol: str = "BTC/USD
     await interaction.response.defer(thinking=True)
     try:
         signal = await get_event_signal(symbol, payout, down_payout)
-        await interaction.followup.send(embed=build_event_embed(format_display_symbol(symbol), signal))
+        await interaction.followup.send(embed=build_tracked_event_embed(format_display_symbol(symbol), signal,
+                                                                      interaction.user.id, interaction.guild_id))
     except ValueError as exc:
         await interaction.followup.send(str(exc), ephemeral=True)
     except Exception:
@@ -1074,7 +1140,8 @@ async def prefix_event(ctx: commands.Context, symbol: str = "BTC/USDT", payout: 
     async with ctx.typing():
         try:
             signal = await get_event_signal(symbol, payout, down_payout)
-            await ctx.send(embed=build_event_embed(format_display_symbol(symbol), signal))
+            await ctx.send(embed=build_tracked_event_embed(format_display_symbol(symbol), signal,
+                                                         ctx.author.id, ctx.guild.id if ctx.guild else None))
         except ValueError as exc:
             await ctx.send(str(exc))
         except Exception:
@@ -3219,6 +3286,18 @@ async def before_ema_sentinel():
 
 
 # ==================== MAIN ENTRYPOINT ====================
+
+@tasks.loop(seconds=2)
+async def event_paper_settlement_loop():
+    try:
+        await settle_due_events(event_tracker, mexc_client)
+    except Exception:
+        logger.exception("Event Futures paper settlement failed; will retry on the next poll")
+
+
+@event_paper_settlement_loop.before_loop
+async def before_event_settlement():
+    await bot.wait_until_ready()
 
 async def main():
     token = config.DISCORD_BOT_TOKEN

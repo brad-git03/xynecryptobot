@@ -26,6 +26,7 @@ class EventSignal:
     ties: int = 0
     lower_win_rate: Optional[float] = None
     historical_ev: Optional[float] = None
+    index_time: Optional[float] = None
 
 
 def break_even_rate(payout_pct: float) -> float:
@@ -82,6 +83,7 @@ def analyze_event(df: Optional[pd.DataFrame], index_price: Optional[float],
         result.reason = "A fresh MEXC index quote (within 30 seconds) is unavailable."
         return result
     result.index_price = index_price
+    result.index_time = quote_time
     required = ["open_time", "open", "high", "low", "close"]
     if df is None or not set(required).issubset(df.columns):
         result.reason = "Index candle history is unavailable."
